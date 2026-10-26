@@ -12,11 +12,14 @@ xhs-humanlike 环境自检
     python3 doctor.py --adb ~/Library/Android/sdk/platform-tools/adb
 """
 
-import subprocess, re, sys, argparse, os, shutil
+import subprocess, re, sys, argparse, os, shutil, tempfile
 import xml.etree.ElementTree as ET
 
 PKG = "com.xingin.xhs"
 BASE_W, BASE_H = 1080, 2340
+
+# 临时文件放系统临时目录：Windows 上没有 /tmp，写死会让 adb pull 失败
+DOCTOR_XML = os.path.join(tempfile.gettempdir(), "_doctor.xml")
 
 OK, BAD, WARN = "✔", "✘", "!"
 
@@ -46,7 +49,8 @@ def resolve_adb(explicit=None):
 def run(adb, *args, timeout=25):
     cmd = [adb] + list(args)
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
     except FileNotFoundError:
         return None
     except subprocess.TimeoutExpired:
@@ -54,6 +58,13 @@ def run(adb, *args, timeout=25):
 
 
 def main():
+    # Windows 上输出重定向到文件时编码不是 UTF-8，✔/✘/emoji 会抛 UnicodeEncodeError
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
     ap = argparse.ArgumentParser()
     ap.add_argument("-s", "--serial", default=None)
     ap.add_argument("--adb", default=None)
@@ -188,11 +199,11 @@ def main():
         soft(f"当前前台不是小红书（{cur}），脚本会尝试自动拉起")
 
     sh("uiautomator", "dump", "/sdcard/_doctor.xml", timeout=25)
-    run(adb, *(["-s", srl] if srl else []), "pull", "/sdcard/_doctor.xml", "/tmp/_doctor.xml")
+    run(adb, *(["-s", srl] if srl else []), "pull", "/sdcard/_doctor.xml", DOCTOR_XML)
     sh("rm", "/sdcard/_doctor.xml")
     cards = []
     try:
-        root = ET.parse("/tmp/_doctor.xml").getroot()
+        root = ET.parse(DOCTOR_XML).getroot()
         for n in root.iter("node"):
             d = (n.get("content-desc") or "").strip()
             if d.startswith("笔记"):

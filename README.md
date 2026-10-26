@@ -1,6 +1,6 @@
 # xhs-humanlike
 
-用 adb 注入触摸事件，模拟真人刷小红书「发现」页的行为。
+Python + adb injects real system touch events into an Android phone so it browses Xiaohongshu by itself: curved swipes in four strengths, posts opened and read, images flipped, comments scrolled, the odd like, random idle pauses. No root, nothing installed, nothing left behind. Tested on macOS; Windows adapted but not yet verified on hardware.
 
 不 root、不装 App、不 hook、不读应用私有数据 —— 手机端零安装，全部动作都是 Android 系统自带的标准输入事件。
 核心不是"能滑"，而是**滑得像人**：会连着快划十几屏什么都不看，会在一篇里停留一分半，会把评论区一路翻到底，也会把手机放下发呆。
@@ -75,6 +75,9 @@ brew install --cask android-platform-tools
 ```
 
 手机端准备：设置 → 关于手机 → 连点「版本号」7 次 → 返回设置 → 开发者选项 → 打开「USB 调试」→ 插线 → 手机上点「允许 USB 调试」。
+
+**Windows 用户**：命令里的 `python3` 换成 `python`；先执行一次 `set PYTHONUTF8=1`（否则日志里的
+中文和 emoji 在重定向到文件时会报编码错误）。详见 [docs/FAQ.md](docs/FAQ.md) 的「Windows 上的问题」。
 
 ---
 

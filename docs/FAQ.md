@@ -174,9 +174,31 @@ adb shell svc power stayon false
 
 ## Windows 上的问题
 
-- `python3` 可能叫 `python` 或 `py`，按你的环境改。
-- 中文输出乱码：`chcp 65001` 切到 UTF-8。
-- 路径带空格要加引号，`--adb "C:\platform-tools\adb.exe"`。
+Windows 能跑，但要在 PowerShell / cmd 里多做三步（`python` 而不是 `python3`）：
+
+```bat
+:: 1) 让中文和 emoji 正常输出（否则重定向到文件时会 UnicodeEncodeError）
+set PYTHONUTF8=1
+
+:: 2) 确认 adb 在 PATH 里；没加的话用 --adb 指定
+adb version
+python doctor.py --adb "C:\platform-tools\adb.exe"
+
+:: 3) 用 python 而不是 python3（Windows 上通常没有 python3 这个命令）
+python doctor.py
+```
+
+其他注意点：
+
+- **`python3` 不存在**。用 `python`，或者装了 Python Launcher 的话用 `py -3`。README 里所有
+  `python3 xxx.py` 在 Windows 上都换成 `python xxx.py`。
+- **中文/emoji 乱码**：`chcp 65001` 只影响当前窗口；`set PYTHONUTF8=1` 更彻底。如果是永久设置，
+  在「系统属性 → 环境变量」里加 `PYTHONUTF8=1`。
+- **路径带空格要加引号**：`--adb "C:\Program Files\platform-tools\adb.exe"`。
+- **临时文件**：脚本的 UI dump 落在系统临时目录（`%TEMP%`，通常是
+  `C:\Users\你\AppData\Local\Temp`）。如果你的用户名是中文、`adb pull` 报路径错误，把
+  `TEMP` 环境变量指到一个纯英文目录（比如 `D:\tmp`）再跑。
+- **无线调试**（Android 11+）在 Windows 上一样可用，`adb pair` / `adb connect` 命令不变。
 
 ---
 

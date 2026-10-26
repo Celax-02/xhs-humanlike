@@ -20,12 +20,13 @@ xhs-humanlike —— 拟人化小红书自动浏览
 完整说明见 README.md，行为模型与调参见 docs/BEHAVIOR.md。
 """
 
-import subprocess, random, time, argparse, re, math, sys, os, shutil
+import subprocess, random, time, argparse, re, math, sys, os, shutil, tempfile
 import xml.etree.ElementTree as ET
 
 # ================= 配置 =================
 ADB = "adb"                      # adb 路径；不在 PATH 里会自动在常见位置查找
-LOCAL_UI = "/tmp/_xhs_ui.xml"
+# 临时文件放系统临时目录：Windows 上没有 /tmp，写死会让 adb pull 失败
+LOCAL_UI = os.path.join(tempfile.gettempdir(), "_xhs_ui.xml")
 
 PKG = "com.xingin.xhs"           # 小红书包名
 ACT_FEED = "IndexActivityV2"     # 信息流 Activity
@@ -80,7 +81,8 @@ def ad(*args, timeout=25):
             if joined.startswith("input "):
                 return None
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
     except FileNotFoundError:
         sys.exit(f"找不到 adb（{ADB}）。\n"
                  "请安装 Android platform-tools，或用 --adb 指定完整路径。\n"
@@ -727,6 +729,14 @@ PHASE_CN = {"skim": "快速划过", "drift": "正常浏览", "deep": "沉浸细�
 
 
 def main():
+    # Windows 上把输出重定向到文件时控制台编码不是 UTF-8，日志里的 emoji 会直接抛
+    # UnicodeEncodeError。这里只放松错误处理（不改编码），控制台里 emoji 照常显示。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
     ap = argparse.ArgumentParser(
         description="拟人化小红书自动浏览（adb 注入触摸，无需 root）")
     ap.add_argument("-t", "--minutes", type=float, default=20, help="运行时长（分钟），默认 20")

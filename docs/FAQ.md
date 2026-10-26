@@ -174,7 +174,8 @@ adb shell svc power stayon false
 
 ## Windows 上的问题
 
-Windows 能跑，但要在 PowerShell / cmd 里多做三步（`python` 而不是 `python3`）：
+代码层面已经做了 Windows 适配（临时目录、控制台编码、adb 路径候选），但**没有在 Windows 真机上跑过完整的一次**。
+下面三步是在 PowerShell / cmd 里必须注意的（`python` 而不是 `python3`）：
 
 ```bat
 :: 1) 让中文和 emoji 正常输出（否则重定向到文件时会 UnicodeEncodeError）

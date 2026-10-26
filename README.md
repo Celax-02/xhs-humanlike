@@ -1,6 +1,9 @@
 # xhs-humanlike
 
-Python + adb injects real system touch events into an Android phone so it browses Xiaohongshu by itself: curved swipes in four strengths, posts opened and read, images flipped, comments scrolled, the odd like, random idle pauses. No root, nothing installed, nothing left behind. Tested on macOS; Windows adapted but not yet verified on hardware.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-3776AB.svg)](https://www.python.org/)
+
+用 adb 注入触摸事件，模拟真人刷小红书「发现」页的行为。
 
 不 root、不装 App、不 hook、不读应用私有数据 —— 手机端零安装，全部动作都是 Android 系统自带的标准输入事件。
 核心不是"能滑"，而是**滑得像人**：会连着快划十几屏什么都不看，会在一篇里停留一分半，会把评论区一路翻到底，也会把手机放下发呆。
@@ -56,7 +59,7 @@ Python + adb injects real system touch events into an Android phone so it browse
 
 | 项目 | 要求 |
 |---|---|
-| 电脑 | macOS / Linux / Windows 均可 |
+| 电脑 | macOS 实测通过；Windows 已完成适配（未在真机验证）；Linux 未验证 |
 | Python | 3.8+，**不需要任何第三方包** |
 | adb | Android platform-tools（见下方安装） |
 | 手机 | Android 8+，已开启开发者选项与 USB 调试 |
@@ -84,7 +87,7 @@ brew install --cask android-platform-tools
 ## 快速开始
 
 ```bash
-git clone https://github.com/<your-name>/xhs-humanlike.git
+git clone https://github.com/Celax-02/xhs-humanlike.git
 cd xhs-humanlike
 
 # 1. 先自检，逐项告诉你哪里不通

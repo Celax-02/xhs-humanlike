@@ -762,7 +762,7 @@ def main():
 
     deadline = time.time() + args.minutes * 60
     t_start = time.time()
-    print(f"设备 {w}x{h} · 上限 {args.minutes:.0f} 分钟 · "
+    print(f"设备 {w}x{h} · 上限 {args.minutes:g} 分钟 · "
           f"{'曲线触摸' if USE_MOTION else '直线滑动'}"
           f"{' · DRY-RUN' if DRY else ''} · Ctrl+C 停止\n")
 

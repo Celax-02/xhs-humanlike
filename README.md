@@ -203,6 +203,14 @@ xhs-humanlike/
 
 ---
 
+## 🤝 社区认可与友情链接
+
+本项目已链接并高度认可 LINUX DO 社区，感谢社区佬友的交流、反馈与支持：
+
+- 🌐 [LINUX DO 社区](https://linux.do/) —— 新的理想型社区（真诚、友善、团结、专业，共建你我引以为荣之社区）
+
+---
+
 ## License
 
 MIT，见 [LICENSE](LICENSE)。

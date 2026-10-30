@@ -69,6 +69,27 @@ def resolve_adb(explicit=None):
     return "adb"
 
 
+def list_devices():
+    """返回当前已授权且在线的设备序列号列表（不带 -s 执行，不受 SERIAL 影响）"""
+    try:
+        r = subprocess.run([ADB, "devices"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=15)
+    except Exception:
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            out.append(parts[0])
+    return out
+
+
+def ui_tmp_path():
+    """每个进程（每台设备）用独立的临时文件，否则并行跑会互相覆盖 XML"""
+    tag = re.sub(r"[^0-9A-Za-z_.-]", "_", SERIAL) if SERIAL else f"pid{os.getpid()}"
+    return os.path.join(tempfile.gettempdir(), f"_xhs_ui_{tag}.xml")
+
+
 def ad(*args, timeout=25):
     cmd = [ADB]
     if SERIAL:
@@ -750,7 +771,7 @@ def main():
     ap.add_argument("--adb", default=None, help="adb 可执行文件路径")
     args = ap.parse_args()
 
-    global USE_MOTION, SERIAL, ADB, DRY
+    global USE_MOTION, SERIAL, ADB, DRY, LOCAL_UI
     if args.classic:
         USE_MOTION = False
     if args.dry_run:
@@ -759,6 +780,21 @@ def main():
     if args.serial:
         SERIAL = args.serial
     ADB = resolve_adb(args.adb)
+
+    # 多设备：没指定 -s 时自动挑选唯一设备；有多台则要求显式指定，否则 adb 会报
+    # "more than one device"，每个命令都失败，看起来像是脚本坏了。
+    if not SERIAL:
+        serials = list_devices()
+        if len(serials) > 1:
+            print("❌ 检测到多台设备，请用 -s 指定要操作哪一台"
+                  "（想同时刷多台，就每台起一个进程）：")
+            for sn in serials:
+                print(f"   python3 xhs_auto.py -s {sn} -t 20")
+            return
+        if len(serials) == 1:
+            SERIAL = serials[0]
+    LOCAL_UI = ui_tmp_path()
+
     if args.seed is not None:
         random.seed(args.seed)
 
@@ -772,7 +808,7 @@ def main():
 
     deadline = time.time() + args.minutes * 60
     t_start = time.time()
-    print(f"设备 {w}x{h} · 上限 {args.minutes:g} 分钟 · "
+    print(f"设备 {SERIAL or '(默认)'} {w}x{h} · 上限 {args.minutes:g} 分钟 · "
           f"{'曲线触摸' if USE_MOTION else '直线滑动'}"
           f"{' · DRY-RUN' if DRY else ''} · Ctrl+C 停止\n")
 

@@ -65,6 +65,7 @@
 | 手机 | Android 8+，已开启开发者选项与 USB 调试 |
 | 小红书 | 已安装并**已登录**，能正常刷「发现」页 |
 | Root | **不需要** |
+| Node（可选） | 18+，仅构建工具台前端时需要 |
 
 装 adb：
 
@@ -105,6 +106,32 @@ python3 xhs_auto.py -t 20 --like 0.03 --fav 0.01
 
 ---
 
+## 工具台（可选）
+
+`xhs_auto.py` 仍然是零依赖的独立脚本。如果想要一个本地网页控制台，把自动刷帖、环境自检、
+账号快照、收藏导出、发布前自检、草稿整理放在一起，每个工具一个启动按钮：
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements-console.txt
+
+cd console/web && npm ci && npm run build && cd ../..
+
+python3 console.py          # 打开打印出来的 http://127.0.0.1:8765/?token=...
+```
+
+- 后端 FastAPI，前端 Vue 3 + TypeScript + Vite，构建产物由后端托管。
+- Node 只在构建前端时需要；运行期只需要 Python 3.9+。
+- 同一台设备同一时间只运行一个工具，不同设备可以并行。设备忙时返回 409，不排队。
+- 同一份 `runs/` 只允许一个控制台实例；重复启动会提示，`--force` 可覆盖。
+- 新增工具：在 `console/tools/` 放一个继承 `Tool` 的文件，刷新页面即可出现卡片。
+- 安全边界、进程模型与实现顺序见 [docs/CONSOLE-ARCHITECTURE.md](docs/CONSOLE-ARCHITECTURE.md)。
+
+控制台只提供浏览、读取自己账号数据、导出自己收藏、发布前检查与草稿整理这类辅助工具，
+不包含自动点赞、评论、关注、私信或多账号运营工具。
+
+---
+
 ## 参数
 
 | 参数 | 默认 | 说明 |
@@ -120,6 +147,29 @@ python3 xhs_auto.py -t 20 --like 0.03 --fav 0.01
 | `--adb` | `adb` | adb 可执行文件路径 |
 
 互动概率建议不超过 5%。真人刷 20 分钟通常点赞个位数，`--like 0.1` 就意味着平均每十篇点一次，明显偏高。
+
+---
+
+## 同时刷多台手机
+
+同时插两台（或更多）手机时，用 `-s` 指定序列号，**一台一个进程**，各自跑各自的行为模型：
+
+```bash
+# 先看有哪些设备
+adb devices
+
+# 每台起一个进程，各刷各的
+python3 xhs_auto.py -s 21982877 -t 20 &
+python3 xhs_auto.py -s 5bbe7f4b -t 20 &
+```
+
+几点说明：
+
+- **不指定 `-s` 时**，脚本会自动选用唯一在线的那台；一旦检测到多台，会直接列出序列号并提示你指定，而不是让 adb 抛 `more than one device` 然后每个命令都失败。
+- **临时文件按设备隔离**，形如 `_xhs_ui_<序列号>.xml`，并行运行不会互相覆盖界面节点树。
+- **每台独立抽随机数**，节奏互不相关，不会出现两台同步滑动的情况。
+- **屏幕常亮逐台生效**，某台先结束只恢复那一台，不影响另一台。
+- Windows 上没有 `&`，开两个终端窗口分别执行即可。
 
 ---
 
@@ -153,8 +203,20 @@ python3 xhs_auto.py -t 20 --like 0.03 --fav 0.01
 xhs-humanlike/
 ├── xhs_auto.py           主脚本，单文件无依赖
 ├── doctor.py             环境自检，跑之前先跑这个
+├── console.py            工具台入口
+├── requirements-console.txt  工具台后端依赖（CLI 不需要）
+├── console/
+│   ├── server.py         FastAPI 路由、token 校验、静态文件
+│   ├── runner.py         子进程、设备锁、日志、兜底清理
+│   ├── registry.py       扫描并加载 tools/
+│   ├── worker.py         单个工具的运行进程
+│   ├── core.py           adb 与界面观测
+│   ├── draftlib.py       草稿与图片解析
+│   ├── tools/            工具插件
+│   └── web/              Vue 3 + TypeScript 前端
 ├── docs/
 │   ├── BEHAVIOR.md       行为模型详解与调参手册（想改得更像人就改这里）
+│   ├── CONSOLE-ARCHITECTURE.md  工具台架构设计与边界
 │   ├── AGENT.md          用 AI Agent 运行本项目时的提示词模板
 │   └── FAQ.md            常见问题与故障排查
 ├── examples/

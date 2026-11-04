@@ -31,6 +31,7 @@ LOCAL_UI = os.path.join(tempfile.gettempdir(), "_xhs_ui.xml")
 PKG = "com.xingin.xhs"           # 小红书包名
 ACT_FEED = "IndexActivityV2"     # 信息流 Activity
 ACT_DETAIL = "NoteDetailActivity"  # 帖子详情 Activity
+ACT_SEARCH = "GlobalSearchActivity"  # 搜索页（搜索入口和结果列表都在这）
 
 # 所有手势坐标都按 1080x2340 这台参考机写死，运行时按实际分辨率等比缩放
 BASE_W, BASE_H = 1080, 2340
@@ -230,6 +231,8 @@ def focus():
     w = m.group(1)
     if ACT_DETAIL in w:
         return "detail"
+    if ACT_SEARCH in w:
+        return "search"
     if ACT_FEED in w:
         return "feed"
     return "other"
@@ -276,6 +279,41 @@ def feed_notes(root):
         cx = x1 + (x2 - x1) * random.uniform(0.28, 0.62)
         cy = y1 + (y2 - y1) * random.uniform(0.22, 0.50)
         out.append((title, int(cx), int(cy)))
+    return out
+
+
+def search_notes(root):
+    """
+    搜索结果页是双列瀑布流，卡片容器没有 content-desc。
+    只能靠「可点击的大块矩形」定位卡片，再用落到卡片内的文字节点取标题。
+    """
+    texts, cards = [], []
+    for n in root.iter("node"):
+        b = parse_bounds(n.get("bounds"))
+        if not b:
+            continue
+        t = (n.get("text") or "").strip()
+        if t:
+            texts.append((b, t))
+        if n.get("clickable") == "true":
+            w, h = b[2] - b[0], b[3] - b[1]
+            if w >= 470 and 650 <= h <= 1600:
+                cards.append(b)
+
+    out = []
+    for x1, y1, x2, y2 in cards:
+        inside = [(b, t) for b, t in texts
+                  if b[0] >= x1 - 10 and b[2] <= x2 + 10
+                  and b[1] >= y1 - 10 and b[3] <= y2 + 10]
+        if not inside or any(t == "广告" for _, t in inside):
+            continue
+        cand = [t for _, t in inside if len(t) >= 6]
+        if not cand:
+            continue
+        title = max(cand, key=len)
+        cx = int((x1 + x2) / 2 + random.uniform(-40, 40))
+        cy = int(y1 + (y2 - y1) * random.uniform(0.25, 0.45))
+        out.append((title, cx, cy))
     return out
 
 
@@ -398,8 +436,49 @@ INTEREST = re.compile(r"攻略|教程|干货|指南|怎么|如何|为什么|推�
 HELP = re.compile(r"求助|急|求救|怎么办|翻车|踩坑|失败|报错|卡住|不懂")
 QUESTION = re.compile(r"[?？]")
 
+# ================= 主题定向 =================
+# 只做「在哪张卡上落手指」的偏好，不改任何客户端行为：
+# 仍是在信息流里滑动、点开、停留，只是选帖时按标题匹配主题。
+TOPIC_SETS = {
+    # 裸 AI / RAG 必须加词边界，否则 email、detail、storage 之类会被误判成 AI 内容
+    "ai": re.compile(
+        r"(?<![A-Za-z])AI(?![A-Za-z])|AIGC|人工智能|大模型|语言模型|LLM|GPT|ChatGPT|OpenAI|"
+        r"Claude|Gemini|DeepSeek|千问|Qwen|通义|豆包|文心|Kimi|智谱|混元|Llama|Mistral|"
+        r"Grok|Sora|Midjourney|Agent|智能体|提示词|Prompt|(?<![A-Za-z])RAG(?![A-Za-z])|"
+        r"微调|多模态|生成式|具身智能|算力|机器学习|深度学习|神经网络|Transformer|"
+        r"Embedding|Copilot|Cursor|Codex|ComfyUI|Ollama|vLLM|HuggingFace|Suno|可灵|"
+        r"文生图|图生图|文生视频|英伟达|NVIDIA|GPU|CUDA|数字人|开源模型|模型训练",
+        re.I),
+}
 
-def pick_style(title, energy):
+# 全局计数：本轮点开多少篇、其中多少篇命中主题
+TOPIC_STATE = {"open": 0, "hit": 0}
+TOPIC = None
+
+# 搜索词只用 ASCII：adb 的 input text 打不出中文（需要额外装输入法）
+SEARCH_KW = ["AI", "AI Agent", "ChatGPT", "DeepSeek", "Claude", "GPT", "LLM", "Agent"]
+
+
+def hits_topic(title):
+    return bool(TOPIC and TOPIC.search(title or ""))
+
+
+def want_topic_hit(args):
+    """
+    这一篇「应不应该」点主题相关的。
+    用配额式纠偏而不是固定概率：累计占比低于目标就更容易选中，
+    高于目标就更容易放过 —— 单场几十篇的尺度上能稳住目标比例，
+    又不是严格交替（加了 gauss 噪声）。
+    """
+    if not TOPIC:
+        return False
+    n, hit = TOPIC_STATE["open"], TOPIC_STATE["hit"]
+    need = args.topic_ratio * (n + 1) - hit
+    return chance(max(0.0, min(1.0, need + random.gauss(0, 0.22))))
+
+
+
+def pick_style(title, energy, is_ai=False):
     """按标题内容和当前精力决定这一篇会怎么看"""
     w = {"glance": 1.0, "image": 1.0, "read": 1.0, "comments": 1.0}
 
@@ -416,6 +495,10 @@ def pick_style(title, energy):
         w["glance"] *= 1.8          # 标题短，信息少，划走更快
     if len(title) >= 24:
         w["read"] *= 1.35
+    if is_ai:                       # 冲着这个主题来的，就多看两眼
+        w["read"] *= 1.45
+        w["comments"] *= 1.25
+        w["glance"] *= 0.55
 
     # 精力低的时候更容易只扫一眼，精力高才愿意读和翻评论
     w["read"] *= 0.55 + energy * 1.0
@@ -454,22 +537,57 @@ def comment_depth(energy):
 
 
 # ================= 打开一篇帖子 =================
-def open_note(seen, args, energy):
-    """点开、看完、退出。失败返回 None"""
+def open_note(seen, args, energy, stats=None, source="feed"):
+    """点开、看完、退出。失败返回 None。source: feed（信息流）或 search（搜索结果）"""
     root = dump_ui()
     if root is None:
         return None
-    notes = [x for x in feed_notes(root) if x[0] not in seen]
+    parser = search_notes if source == "search" else feed_notes
+    notes = [x for x in parser(root) if x[0] not in seen]
     if not notes:
         return None
 
-    title, cx, cy = random.choice(notes)
+    # 选哪张卡：默认随机；开了主题定向就按配额纠偏来选
+    is_ai = False
+    if TOPIC:
+        want = want_topic_hit(args)
+        ai = [x for x in notes if hits_topic(x[0])]
+        # 想看点相关的、但这一屏没有，就像人一样多划两屏找一下
+        # （搜索结果页整页都是相关笔记，不需要找）
+        tried = 0
+        while want and not ai and tried < 3 and source == "feed":
+            if stats is not None:
+                stats["screens"] += 1
+            feed_swipe(random.choices(["flick", "normal"], weights=[0.6, 0.4])[0])
+            tried += 1
+            time.sleep(lognorm(1.3, 0.5, 0.4, 3.6))
+            root = dump_ui()
+            if root is None:
+                break
+            notes = [x for x in feed_notes(root) if x[0] not in seen]
+            if not notes:
+                return None
+            ai = [x for x in notes if hits_topic(x[0])]
+        if want and ai:
+            title, cx, cy = random.choice(ai)
+            is_ai = True
+        else:
+            rest = [x for x in notes if not hits_topic(x[0])] if want else notes
+            title, cx, cy = random.choice(rest or notes)
+            is_ai = hits_topic(title)
+    else:
+        title, cx, cy = random.choice(notes)
+        is_ai = hits_topic(title)
+
     tap(cx, cy)
     time.sleep(lognorm(1.5, 0.42, 0.7, 4.0))
 
     if focus() != "detail":
         return None
     seen.add(title)
+    TOPIC_STATE["open"] += 1
+    if is_ai:
+        TOPIC_STATE["hit"] += 1
 
     # 误触：点开了才发现不是想看的，快速退回
     if chance(0.09):
@@ -478,9 +596,9 @@ def open_note(seen, args, energy):
         time.sleep(lognorm(1.1, 0.4, 0.6, 2.4))
         return {"title": title, "style": "glance", "imgs": 1, "flipped": 0,
                 "scrolls": 0, "liked": False, "faved": False,
-                "dwell": 0.9, "mistap": True}
+                "dwell": 0.9, "mistap": True, "ai": is_ai}
 
-    style = pick_style(title, energy)
+    style = pick_style(title, energy, is_ai)
     imgs = 1
     root = dump_ui()
     if root is not None:
@@ -495,8 +613,9 @@ def open_note(seen, args, energy):
     t_in = time.time()
 
     # 点赞/收藏的时机也随机：有时读一半就点，有时看完才点
-    like_now = args.like and chance(args.like)
-    fav_now = args.fav and chance(args.fav)
+    # 主题相关的帖子更容易被点：冲着它来的，互动意愿本来就高
+    like_now = args.like and chance(min(0.30, args.like * (1.9 if is_ai else 1.0)))
+    fav_now = args.fav and chance(min(0.20, args.fav * (1.6 if is_ai else 1.0)))
     like_early = chance(0.45)
 
     def do_like():
@@ -512,6 +631,8 @@ def open_note(seen, args, energy):
             time.sleep(lognorm(0.55, 0.35, 0.3, 1.6))
 
     dwell = dwell_time(style, energy, imgs)
+    if is_ai:                                   # 相关内容看得久一点
+        dwell *= random.uniform(1.12, 1.45)
     time.sleep(dwell * random.uniform(0.38, 0.62))
     if like_early:
         do_like()
@@ -599,15 +720,16 @@ def open_note(seen, args, energy):
         detail_scroll_back()
         time.sleep(lognorm(1.3, 0.5, 0.4, 4.0))
 
+    target = "search" if source == "search" else "feed"
     for _ in range(3):
-        if focus() == "feed":
+        if focus() == target:
             break
         back()
         time.sleep(lognorm(1.3, 0.42, 0.5, 3.2))
 
     return {"title": title, "style": style, "imgs": imgs, "flipped": flipped,
             "scrolls": scrolls, "liked": liked, "faved": faved,
-            "dwell": lived, "mistap": False}
+            "dwell": lived, "mistap": False, "ai": is_ai}
 
 
 def report(r, stats):
@@ -617,6 +739,8 @@ def report(r, stats):
     stats["liked"] += 1 if r["liked"] else 0
     stats["faved"] += 1 if r["faved"] else 0
     stats["dwell"].append(r["dwell"])
+    if r.get("ai"):
+        stats["ai"] += 1
     if r.get("mistap"):
         print(f"  📖 点错了《{r['title'][:20]}》 立刻退回", flush=True)
         return
@@ -629,21 +753,34 @@ def report(r, stats):
         tags.append("♥赞")
     if r["faved"]:
         tags.append("★藏")
-    print(f"  📖 {STYLE_CN[r['style']]}《{r['title'][:20]}》 图{r['imgs']} · "
+    mark = "🤖 " if r.get("ai") else ""
+    print(f"  📖 {mark}{STYLE_CN[r['style']]}《{r['title'][:20]}》 图{r['imgs']} · "
           + " ".join(tags), flush=True)
 
 
 # ================= 行为段 =================
-def seg_skim(deadline, stats, energy, verbose):
+def seg_skim(deadline, seen, args, stats, energy, verbose):
     """
     连着快划，什么都不点。
     这一段里滑动本身也在变：连续甩几下 → 慢一点 → 再甩，不是恒速
+    开了主题定向时，快划途中会被相关标题「拽住」停下来看
     """
     n = max(3, int(lognorm(8, 0.5, 3, 26)))
     mood = random.uniform(0.6, 1.4)          # 这一段自己的「节奏感」
     for i in range(n):
         if time.time() > deadline:
             return
+        if TOPIC and i > 0 and chance(0.13):
+            root = dump_ui()
+            if root is not None:
+                hot = [t for t, _, _ in feed_notes(root)
+                       if hits_topic(t) and t not in seen]
+                if hot:
+                    r = open_note(seen, args, energy, stats)
+                    if r:
+                        report(r, stats)
+                        mood = random.uniform(0.6, 1.4)
+                        continue
         r = random.random()
         if r < 0.55 * mood:
             feed_swipe("flick")
@@ -673,7 +810,7 @@ def seg_drift(deadline, seen, args, stats, energy):
     i = 0
     while time.time() < deadline:
         if i >= quota:
-            r = open_note(seen, args, energy)
+            r = open_note(seen, args, energy, stats)
             if r:
                 report(r, stats)
             else:
@@ -707,7 +844,7 @@ def seg_deep(deadline, seen, args, stats, energy):
     for _ in range(n):
         if time.time() > deadline:
             return
-        r = open_note(seen, args, energy)
+        r = open_note(seen, args, energy, stats)
         if r:
             report(r, stats)
             stagger = lognorm(1.6, 0.6, 0.3, 6.0) * (1.2 - energy * 0.5)
@@ -731,13 +868,96 @@ def seg_rest(deadline, energy):
     time.sleep(min(t, max(0, deadline - time.time())))
 
 
+# ================= 主题定向：搜索通路 =================
+def open_search(kw):
+    """从信息流进搜索，输入关键词并回车。成功（结果页有卡片）返回 True"""
+    if focus() != "search":
+        ensure_feed()
+        root = dump_ui()
+        if root is None:
+            return False
+        btn = None
+        for n in root.iter("node"):
+            d = (n.get("content-desc") or "").strip()
+            if d == "搜索" and n.get("clickable") == "true":
+                b = parse_bounds(n.get("bounds"))
+                if b and b[1] < sy(400):          # 顶栏那个，不是输入框里的按钮
+                    btn = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+                    break
+        if btn is None:
+            return False
+        tap(*btn)
+        time.sleep(lognorm(2.0, 0.30, 1.2, 3.6))
+
+    root = dump_ui()
+    if root is None:
+        return False
+    box = None
+    for n in root.iter("node"):
+        if "EditText" in (n.get("class") or ""):
+            b = parse_bounds(n.get("bounds"))
+            if b:
+                box = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+                break
+    if box is None:
+        return False
+
+    tap(*box, hesitate=False)
+    time.sleep(lognorm(0.9, 0.35, 0.35, 2.2))
+    sh("input", "text", kw)
+    time.sleep(lognorm(0.7, 0.40, 0.25, 2.0))
+    sh("input", "keyevent", "66")               # 回车提交
+    time.sleep(lognorm(3.4, 0.35, 2.0, 6.0))
+
+    root = dump_ui()
+    return root is not None and bool(search_notes(root))
+
+
+def back_to_feed(limit=4):
+    for _ in range(limit):
+        if focus() == "feed":
+            return True
+        back()
+        time.sleep(lognorm(1.4, 0.40, 0.6, 3.2))
+    return focus() == "feed"
+
+
+def seg_topic_search(deadline, seen, args, stats, energy):
+    """搜一个主题词，翻结果、点开看，然后回信息流"""
+    kw = random.choice(SEARCH_KW)
+    if not open_search(kw):
+        print("    搜索页没打开，这轮跳过", flush=True)
+        back_to_feed()
+        return
+    print(f"    🔎 搜「{kw}」看结果", flush=True)
+
+    n = max(2, int(lognorm(3.4, 0.45, 2, 8)))
+    for i in range(n):
+        if time.time() > deadline:
+            break
+        r = open_note(seen, args, energy, stats, source="search")
+        if r:
+            report(r, stats)
+            time.sleep(lognorm(1.9, 0.50, 0.5, 6.0))
+        else:
+            feed_swipe("normal")
+            stats["screens"] += 1
+            time.sleep(lognorm(2.6, 0.50, 0.8, 7.0))
+        if i < n - 1 and chance(0.45):           # 往下翻一屏，看更多结果
+            feed_swipe("normal")
+            stats["screens"] += 1
+            time.sleep(lognorm(2.4, 0.50, 0.8, 6.5))
+
+    back_to_feed()
+
+
 # ================= 主流程 =================
 def ensure_feed():
     for _ in range(4):
         st = focus()
         if st == "feed":
             return True
-        if st in ("detail", "other"):
+        if st in ("detail", "other", "search"):
             back()
         else:
             sh("monkey", "-p", PKG, "-c",
@@ -746,7 +966,8 @@ def ensure_feed():
     return focus() == "feed"
 
 
-PHASE_CN = {"skim": "快速划过", "drift": "正常浏览", "deep": "沉浸细看", "rest": "休息"}
+PHASE_CN = {"skim": "快速划过", "drift": "正常浏览", "deep": "沉浸细看",
+            "rest": "休息", "topic": "定向浏览"}
 
 
 def main():
@@ -769,9 +990,15 @@ def main():
     ap.add_argument("--seed", type=int, default=None, help="随机种子（复现同一场行为）")
     ap.add_argument("-s", "--serial", default=None, help="adb 设备序列号（多设备时指定）")
     ap.add_argument("--adb", default=None, help="adb 可执行文件路径")
+    ap.add_argument("--topic", choices=sorted(TOPIC_SETS), default=None,
+                    help="主题定向：只点相关内容占多数（目前支持 ai）")
+    ap.add_argument("--topic-ratio", type=float, default=0.5,
+                    help="主题内容占点开篇数的目标比例，默认 0.5")
     args = ap.parse_args()
 
-    global USE_MOTION, SERIAL, ADB, DRY, LOCAL_UI
+    global USE_MOTION, SERIAL, ADB, DRY, LOCAL_UI, TOPIC
+    if args.topic:
+        TOPIC = TOPIC_SETS[args.topic]
     if args.classic:
         USE_MOTION = False
     if args.dry_run:
@@ -810,11 +1037,15 @@ def main():
     t_start = time.time()
     print(f"设备 {SERIAL or '(默认)'} {w}x{h} · 上限 {args.minutes:g} 分钟 · "
           f"{'曲线触摸' if USE_MOTION else '直线滑动'}"
-          f"{' · DRY-RUN' if DRY else ''} · Ctrl+C 停止\n")
+          f"{' · DRY-RUN' if DRY else ''} · Ctrl+C 停止")
+    if TOPIC:
+        print(f"定向主题 {args.topic} · 目标占点开篇数 {args.topic_ratio:.0%}"
+              f" · 相关内容会看得更久、更容易点赞")
+    print()
 
     seen = set()
     stats = {"screens": 0, "notes": 0, "flipped": 0,
-             "scrolls": 0, "liked": 0, "faved": 0, "dwell": []}
+             "scrolls": 0, "liked": 0, "faved": 0, "ai": 0, "dwell": []}
     last = None
     energy = random.uniform(0.30, 0.70)          # 开场精力
 
@@ -829,6 +1060,10 @@ def main():
                       ("drift", 0.45),
                       ("deep", 0.18 * (0.35 + energy * 1.5)),
                       ("rest", 0.02 + 0.07 * (1.7 - energy))]
+            if TOPIC:
+                # 主题占比落后得越多，越容易安排一次「搜索 + 翻结果」
+                deficit = max(0.0, args.topic_ratio * (stats["notes"] + 1) - stats["ai"])
+                phases.append(("topic", 0.10 + 1.6 * deficit))
             pool = [(p, w) for p, w in phases if p != last and w > 0] or phases
             phase = random.choices([p[0] for p in pool],
                                    weights=[p[1] for p in pool])[0]
@@ -838,8 +1073,10 @@ def main():
 
             if phase == "rest":
                 seg_rest(deadline, energy)
+            elif phase == "topic":
+                seg_topic_search(deadline, seen, args, stats, energy)
             elif phase == "skim":
-                seg_skim(deadline, stats, energy, args.verbose)
+                seg_skim(deadline, seen, args, stats, energy, args.verbose)
             elif phase == "deep":
                 seg_deep(deadline, seen, args, stats, energy)
             else:
@@ -858,6 +1095,10 @@ def main():
     print(f"划过 {stats['screens']} 屏 · 看了 {stats['notes']} 篇 · "
           f"翻图 {stats['flipped']} 张 · 评论下划 {stats['scrolls']} 次 · "
           f"点赞 {stats['liked']} · 收藏 {stats['faved']}")
+    if TOPIC and stats["notes"]:
+        share = stats["ai"] / stats["notes"]
+        print(f"主题命中 {stats['ai']}/{stats['notes']} 篇 "
+              f"({share:.0%}，目标 {args.topic_ratio:.0%})")
     print(f"单篇平均停留 {avg:.1f}s · 最长 {longest:.0f}s · "
           f"总时长 {(time.time()-t_start)/60:.1f} 分钟")
     if not DRY:

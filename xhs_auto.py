@@ -455,6 +455,91 @@ TOPIC_SETS = {
 TOPIC_STATE = {"open": 0, "hit": 0}
 TOPIC = None
 
+# ================= 内容深度 =================
+# 标题里能读到的「值得坐下来看」的信号：方法论、复盘、原理解读、实测对比……
+DEEP_WORDS = re.compile(
+    r"原理|机制|底层|本质|为什么|如何|怎么|方法论|复盘|拆解|分析|研究|论文|实测|测评|"
+    r"架构|设计|系统|工程|实践|思考|认知|逻辑|教程|指南|避坑|踩坑|经验|总结|干货|"
+    r"深度|全流程|从0到1|源码|实现|优化|调优|评测|解读|洞察|趋势|范式|框架|取舍|"
+    r"权衡|案例|手把手|万字|长文|心得|随笔|笔记|科普|入门|进阶|误区|清单|对比|"
+    r"paper|survey|benchmark|research|deep\s?dive|tutorial|guide|how\s?to", re.I)
+
+# 一眼就知道是「扫过去就行」的：梗图、表情包、短平快、纯情绪
+SHALLOW_WORDS = re.compile(
+    r"meme|梗|表情包|沙雕|哈哈|笑死|笑不活|段子|整活|玩梗|抽象|离谱|搞笑|"
+    r"壁纸|头像|背景图|配图|图集|九宫格|"
+    r"救命|谁懂|家人们|姐妹们|宝子们|绝了|太好笑|笑出声|啊啊啊|"
+    r"测一测|你属于|选一个|接龙|打卡|每日一图|"
+    r"随手拍|今天吃|穿搭|OOTD|开箱|好物|种草|探店", re.I)
+
+EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF]")
+
+# 弱信号：单个词说明不了什么，但凑一起通常就是「有观点、有信息」的内容
+DEEP_WEAK = re.compile(
+    r"观点|真相|问题|答案|行业|产品|技术|模型|工作|读书|访谈|对话|实录|观察|"
+    r"客户|创业|职场|效率|决策|增长|商业|程序员|开发|代码|数据|团队|项目|"
+    r"团队|职业|学习|教育|写作|沟通|管理|选择|判断", re.I)
+
+# 广告/招生/带货：不是「没深度」，是根本不值得看
+AD_WORDS = re.compile(
+    r"报价|价格表|多少钱|优惠|团购|折扣|门店|地址|预约|招生|留学中介|代购|"
+    r"加盟|代理|办证|贷款|保险|房产|装修|医美|减肥|祛痘|包过|速成|兼职|招聘|"
+    r"到手价|限时|私信|咨询|套餐|免费领|链接|购买", re.I)
+
+
+def depth_score(title, imgs=1, is_ai=False):
+    """
+    0~1 的「这篇值不值得认真看」评分。只看标题和图片数，
+    不做内容理解 —— 但人挑帖子本来也是先看标题。
+    """
+    t = title or ""
+    s = 0.45
+
+    deep_hits = len(set(DEEP_WORDS.findall(t)))
+    shallow_hits = len(set(SHALLOW_WORDS.findall(t)))
+    weak_hits = len(set(DEEP_WEAK.findall(t)))
+    ad_hits = len(set(AD_WORDS.findall(t)))
+    s += min(0.42, 0.16 * deep_hits)
+    s += min(0.15, 0.055 * weak_hits)
+    s -= min(0.62, 0.34 * shallow_hits)
+    s -= min(0.50, 0.26 * ad_hits)
+
+    n = len(t)
+    if n >= 22:
+        s += 0.12
+    elif n >= 14:
+        s += 0.06
+    elif n <= 8:
+        s -= 0.16
+
+    if "?" in t or "？" in t:
+        s += 0.07                     # 提问帖，评论区通常有真东西
+    emo = len(EMOJI_RE.findall(t))
+    s -= min(0.18, 0.045 * emo)
+    if imgs >= 9 and n <= 14:
+        s -= 0.12                     # 多图 + 短标题，多半是图集/表情包
+    if is_ai:
+        s += 0.10
+    return max(0.0, min(1.0, s))
+
+
+def depth_band(d):
+    if d >= 0.60:
+        return "deep"
+    if d <= 0.32:
+        return "shallow"
+    return "normal"
+
+
+def card_weight(title, pref, is_ai=False):
+    """
+    信息流里挑哪张卡。pref 是深度偏好强度（0 关闭，越大越挑）。
+    浅内容不是完全排除 —— 真人也会手滑点开梗图，只是概率低。
+    """
+    d = depth_score(title, 1, is_ai)
+    w = 1.0 + pref * (d - 0.45) * 2.6
+    return max(0.06, w)
+
 # 搜索词只用 ASCII：adb 的 input text 打不出中文（需要额外装输入法）
 SEARCH_KW = ["AI", "AI Agent", "ChatGPT", "DeepSeek", "Claude", "GPT", "LLM", "Agent"]
 
@@ -478,8 +563,8 @@ def want_topic_hit(args):
 
 
 
-def pick_style(title, energy, is_ai=False):
-    """按标题内容和当前精力决定这一篇会怎么看"""
+def pick_style(title, energy, is_ai=False, depth=0.45):
+    """按标题内容、深浅和当前精力决定这一篇会怎么看"""
     w = {"glance": 1.0, "image": 1.0, "read": 1.0, "comments": 1.0}
 
     if INTEREST.search(title):
@@ -500,6 +585,19 @@ def pick_style(title, energy, is_ai=False):
         w["comments"] *= 1.25
         w["glance"] *= 0.55
 
+    # 深浅：有信息量的才值得读正文、翻评论；梗图扫一眼就走
+    band = depth_band(depth)
+    if band == "deep":
+        w["read"] *= 2.3
+        w["comments"] *= 1.7
+        w["glance"] *= 0.30
+        w["image"] *= 0.55
+    elif band == "shallow":
+        w["glance"] *= 3.4
+        w["image"] *= 2.2
+        w["read"] *= 0.35
+        w["comments"] *= 0.20
+
     # 精力低的时候更容易只扫一眼，精力高才愿意读和翻评论
     w["read"] *= 0.55 + energy * 1.0
     w["comments"] *= 0.65 + energy * 0.9
@@ -509,8 +607,8 @@ def pick_style(title, energy, is_ai=False):
     return random.choices(keys, weights=[w[k] for k in keys])[0]
 
 
-def dwell_time(style, energy, imgs):
-    """这一篇会停多久（秒）。对数正态 + 精力修正 + 内容量修正"""
+def dwell_time(style, energy, imgs, depth=0.45):
+    """这一篇会停多久（秒）。对数正态 + 精力修正 + 内容量修正 + 深度修正"""
     base = {"glance": 2.4, "image": 4.2, "read": 9.5, "comments": 6.5}[style]
     sigma = {"glance": 0.42, "image": 0.50, "read": 0.52, "comments": 0.48}[style]
     lo, hi = {"glance": (1.2, 8.0), "image": (2.0, 26.0),
@@ -518,25 +616,40 @@ def dwell_time(style, energy, imgs):
 
     v = lognorm(base, sigma, lo, hi)
     v *= 0.70 + energy * 0.62                       # 精力低就看得快
+    v *= 0.62 + depth * 1.15                        # 有料的多停，水帖快走
     if imgs >= 6:
         v *= random.uniform(1.08, 1.35)
     if chance(0.06):                                # 偶尔被某篇彻底吸住
         v *= random.uniform(1.6, 2.6)
+    if depth_band(depth) == "shallow":
+        v = min(v, lognorm(4.5, 0.45, 1.5, 9.0))    # 梗图不会看太久
     return max(lo, min(hi, v))
 
 
-def comment_depth(energy):
-    """评论区会往下滑几次。指数分布，重尾，能到 20+"""
+def comment_depth(energy, depth=0.45):
+    """评论区会往下滑几次。指数分布，重尾，能到 20+；水帖基本不翻"""
+    if depth_band(depth) == "shallow":
+        return 0 if chance(0.80) else random.randint(1, 2)
     r = random.random()
-    if r < 0.22:                                    # 打开看看就退，不往下翻
+    if r < 0.22 and depth_band(depth) != "deep":    # 打开看看就退，不往下翻
         return 0
-    if r < 0.40:                                    # 浅翻两条
+    if r < 0.40 and depth_band(depth) != "deep":    # 浅翻两条
         return random.randint(1, 3)
     n = 3 + int(random.expovariate(0.30 / max(0.4, energy)))   # 长尾
-    return min(n, 24)
+    if depth_band(depth) == "deep":
+        n += random.randint(2, 7)                   # 有内容的帖子，评论区也值得翻
+    return min(n, 28)
 
 
 # ================= 打开一篇帖子 =================
+def pick_note(notes, args):
+    """按深度偏好加权挑一张卡；pref=0 时退化为纯随机"""
+    if args.depth <= 0 or len(notes) == 1:
+        return random.choice(notes)
+    ws = [card_weight(t, args.depth) for t, _, _ in notes]
+    return random.choices(notes, weights=ws)[0]
+
+
 def open_note(seen, args, energy, stats=None, source="feed"):
     """点开、看完、退出。失败返回 None。source: feed（信息流）或 search（搜索结果）"""
     root = dump_ui()
@@ -547,7 +660,7 @@ def open_note(seen, args, energy, stats=None, source="feed"):
     if not notes:
         return None
 
-    # 选哪张卡：默认随机；开了主题定向就按配额纠偏来选
+    # 选哪张卡：主题定向按配额纠偏，其余情况按深度偏好加权
     is_ai = False
     if TOPIC:
         want = want_topic_hit(args)
@@ -569,14 +682,14 @@ def open_note(seen, args, energy, stats=None, source="feed"):
                 return None
             ai = [x for x in notes if hits_topic(x[0])]
         if want and ai:
-            title, cx, cy = random.choice(ai)
+            title, cx, cy = pick_note(ai, args)
             is_ai = True
         else:
             rest = [x for x in notes if not hits_topic(x[0])] if want else notes
-            title, cx, cy = random.choice(rest or notes)
+            title, cx, cy = pick_note(rest or notes, args)
             is_ai = hits_topic(title)
     else:
-        title, cx, cy = random.choice(notes)
+        title, cx, cy = pick_note(notes, args)
         is_ai = hits_topic(title)
 
     tap(cx, cy)
@@ -596,9 +709,9 @@ def open_note(seen, args, energy, stats=None, source="feed"):
         time.sleep(lognorm(1.1, 0.4, 0.6, 2.4))
         return {"title": title, "style": "glance", "imgs": 1, "flipped": 0,
                 "scrolls": 0, "liked": False, "faved": False,
-                "dwell": 0.9, "mistap": True, "ai": is_ai}
+                "dwell": 0.9, "mistap": True, "ai": is_ai, "depth": 0.0}
 
-    style = pick_style(title, energy, is_ai)
+    t_in = time.time()
     imgs = 1
     root = dump_ui()
     if root is not None:
@@ -608,14 +721,42 @@ def open_note(seen, args, energy, stats=None, source="feed"):
                 imgs = int(m.group(1))
                 break
 
+    depth = depth_score(title, imgs, is_ai)
+    band = depth_band(depth)
+
+    # 梗图/表情包/纯情绪帖：翻两张、扫一眼就退出，不点赞也不翻评论。
+    # 这类内容点开又秒退，本身就是给算法「我不吃这个」的信号。
+    if band == "shallow" and chance(0.45 + 0.5 * min(1.0, args.depth)):
+        moved = 0
+        if imgs > 1 and chance(0.40):
+            for _ in range(random.randint(1, 2)):
+                flip_image(forward=True)
+                moved += 1
+                time.sleep(lognorm(1.5, 0.45, 0.5, 4.0))
+        time.sleep(lognorm(2.3, 0.5, 0.6, 6.0))
+        if focus() == "detail" and chance(0.35):    # 偶尔划一下正文确认没料
+            detail_scroll(random.uniform(0.7, 1.0))
+        if focus() == "detail":
+            back()
+            time.sleep(lognorm(1.0, 0.4, 0.5, 2.4))
+        return {"title": title, "style": "glance", "imgs": imgs, "flipped": moved,
+                "scrolls": 0, "liked": False, "faved": False,
+                "dwell": time.time() - t_in, "mistap": False, "ai": is_ai,
+                "depth": depth, "shallow": True}
+
+    style = pick_style(title, energy, is_ai, depth)
+
     flipped = scrolls = 0
     liked = faved = False
-    t_in = time.time()
 
     # 点赞/收藏的时机也随机：有时读一半就点，有时看完才点
     # 主题相关的帖子更容易被点：冲着它来的，互动意愿本来就高
-    like_now = args.like and chance(min(0.30, args.like * (1.9 if is_ai else 1.0)))
-    fav_now = args.fav and chance(min(0.20, args.fav * (1.6 if is_ai else 1.0)))
+    # 有信息量的帖子更容易被收藏 —— 收藏的本质是「以后还要回来看」
+    ai_boost = 1.9 if is_ai else 1.0
+    deep_boost = 1.0 + 1.5 * max(0.0, depth - 0.45)
+    like_now = args.like and chance(min(0.30, args.like * ai_boost * deep_boost))
+    fav_now = args.fav and chance(min(0.20, args.fav * (1.6 if is_ai else 1.0)
+                                    * deep_boost ** 1.7))
     like_early = chance(0.45)
 
     def do_like():
@@ -630,7 +771,7 @@ def open_note(seen, args, energy, stats=None, source="feed"):
             faved = True
             time.sleep(lognorm(0.55, 0.35, 0.3, 1.6))
 
-    dwell = dwell_time(style, energy, imgs)
+    dwell = dwell_time(style, energy, imgs, depth)
     if is_ai:                                   # 相关内容看得久一点
         dwell *= random.uniform(1.12, 1.45)
     time.sleep(dwell * random.uniform(0.38, 0.62))
@@ -685,9 +826,9 @@ def open_note(seen, args, energy, stats=None, source="feed"):
             flipped += 1
             time.sleep(lognorm(2.2, 0.5, 0.7, 7.0))
 
-        depth = comment_depth(energy)
+        cdepth = comment_depth(energy, depth)
         # 先快速往下甩几次，把评论区拉出来
-        lead = min(depth, random.randint(1, 3))
+        lead = min(cdepth, random.randint(1, 3))
         for _ in range(lead):
             if focus() != "detail":
                 break
@@ -695,14 +836,14 @@ def open_note(seen, args, energy, stats=None, source="feed"):
             scrolls += 1
             time.sleep(lognorm(1.1, 0.45, 0.35, 4.0))
 
-        for i in range(depth - lead):
+        for i in range(cdepth - lead):
             if focus() != "detail":
                 break
             p = lognorm(0.72, 0.30, 0.35, 1.9)       # 大多慢拖，偶尔用力
             detail_scroll(p)
             scrolls += 1
             # 越往后耐心越差，停留变短
-            fade = 1.0 - 0.35 * (i / max(1, depth - lead))
+            fade = 1.0 - 0.35 * (i / max(1, cdepth - lead))
             time.sleep(lognorm(2.6 * fade, 0.52, 0.5, 9.0))
             if chance(0.14):                        # 划过头，拉回来一点
                 detail_scroll_back()
@@ -729,7 +870,7 @@ def open_note(seen, args, energy, stats=None, source="feed"):
 
     return {"title": title, "style": style, "imgs": imgs, "flipped": flipped,
             "scrolls": scrolls, "liked": liked, "faved": faved,
-            "dwell": lived, "mistap": False, "ai": is_ai}
+            "dwell": lived, "mistap": False, "ai": is_ai, "depth": depth}
 
 
 def report(r, stats):
@@ -739,6 +880,15 @@ def report(r, stats):
     stats["liked"] += 1 if r["liked"] else 0
     stats["faved"] += 1 if r["faved"] else 0
     stats["dwell"].append(r["dwell"])
+    d = r.get("depth", 0.45)
+    band = depth_band(d)
+    if not r.get("mistap"):                 # 误触不算「选了这篇」
+        stats["depths"].append(d)
+        if band == "deep":
+            stats["deep"] += 1
+            stats["deep_dwell"].append(r["dwell"])
+        elif band == "shallow":
+            stats["shallow"] += 1
     if r.get("ai"):
         stats["ai"] += 1
     if r.get("mistap"):
@@ -754,8 +904,12 @@ def report(r, stats):
     if r["faved"]:
         tags.append("★藏")
     mark = "🤖 " if r.get("ai") else ""
-    print(f"  📖 {mark}{STYLE_CN[r['style']]}《{r['title'][:20]}》 图{r['imgs']} · "
-          + " ".join(tags), flush=True)
+    dtag = {"deep": "📚", "shallow": "💤", "normal": ""}.get(band, "")
+    extra = ""
+    if r.get("shallow"):
+        extra = " · 没料，划走"
+    print(f"  📖 {mark}{dtag}{STYLE_CN[r['style']]}《{r['title'][:20]}》 图{r['imgs']} · "
+          + " ".join(tags) + extra, flush=True)
 
 
 # ================= 行为段 =================
@@ -767,14 +921,16 @@ def seg_skim(deadline, seen, args, stats, energy, verbose):
     """
     n = max(3, int(lognorm(8, 0.5, 3, 26)))
     mood = random.uniform(0.6, 1.4)          # 这一段自己的「节奏感」
+    hook_p = 0.13 if TOPIC else 0.05 * args.depth   # 快划途中被标题拽住的概率
     for i in range(n):
         if time.time() > deadline:
             return
-        if TOPIC and i > 0 and chance(0.13):
+        if i > 0 and chance(hook_p):
             root = dump_ui()
             if root is not None:
                 hot = [t for t, _, _ in feed_notes(root)
-                       if hits_topic(t) and t not in seen]
+                       if t not in seen and (hits_topic(t) if TOPIC
+                                             else depth_score(t) >= 0.6)]
                 if hot:
                     r = open_note(seen, args, energy, stats)
                     if r:
@@ -994,6 +1150,8 @@ def main():
                     help="主题定向：只点相关内容占多数（目前支持 ai）")
     ap.add_argument("--topic-ratio", type=float, default=0.5,
                     help="主题内容占点开篇数的目标比例，默认 0.5")
+    ap.add_argument("--depth", type=float, default=0.6,
+                    help="内容深度偏好强度，0~1，默认 0.6；0 关闭（梗图与长文一视同仁）")
     args = ap.parse_args()
 
     global USE_MOTION, SERIAL, ADB, DRY, LOCAL_UI, TOPIC
@@ -1041,11 +1199,15 @@ def main():
     if TOPIC:
         print(f"定向主题 {args.topic} · 目标占点开篇数 {args.topic_ratio:.0%}"
               f" · 相关内容会看得更久、更容易点赞")
+    if args.depth > 0:
+        print(f"深度偏好 {args.depth:.0%} · 优先点开有信息量的长文/复盘/原理解读，"
+              f"梗图扫两眼就退")
     print()
 
     seen = set()
     stats = {"screens": 0, "notes": 0, "flipped": 0,
-             "scrolls": 0, "liked": 0, "faved": 0, "ai": 0, "dwell": []}
+             "scrolls": 0, "liked": 0, "faved": 0, "ai": 0, "dwell": [],
+             "deep": 0, "shallow": 0, "depths": [], "deep_dwell": []}
     last = None
     energy = random.uniform(0.30, 0.70)          # 开场精力
 
@@ -1056,9 +1218,9 @@ def main():
             energy += random.gauss(0, 0.17) - frac * 0.045
             energy = max(0.05, min(0.95, energy))
 
-            phases = [("skim", 0.30 * (1.65 - energy)),
+            phases = [("skim", 0.30 * (1.65 - energy) * (1.0 - 0.30 * args.depth)),
                       ("drift", 0.45),
-                      ("deep", 0.18 * (0.35 + energy * 1.5)),
+                      ("deep", 0.18 * (0.35 + energy * 1.5) * (1.0 + 0.9 * args.depth)),
                       ("rest", 0.02 + 0.07 * (1.7 - energy))]
             if TOPIC:
                 # 主题占比落后得越多，越容易安排一次「搜索 + 翻结果」
@@ -1099,6 +1261,16 @@ def main():
         share = stats["ai"] / stats["notes"]
         print(f"主题命中 {stats['ai']}/{stats['notes']} 篇 "
               f"({share:.0%}，目标 {args.topic_ratio:.0%})")
+    if stats["notes"] and args.depth > 0:
+        n = stats["notes"]
+        avg_d = sum(stats["depths"]) / len(stats["depths"]) if stats["depths"] else 0
+        print(f"深度：📚 有料 {stats['deep']}/{n} 篇 ({stats['deep']/n:.0%}) · "
+              f"💤 水帖 {stats['shallow']}/{n} 篇 ({stats['shallow']/n:.0%}) · "
+              f"平均深度分 {avg_d:.2f}")
+        deep_dwell = stats["deep_dwell"]
+        if deep_dwell:
+            print(f"      深帖平均停留 {sum(deep_dwell)/len(deep_dwell):.1f}s · "
+                  f"最长 {max(deep_dwell):.0f}s")
     print(f"单篇平均停留 {avg:.1f}s · 最长 {longest:.0f}s · "
           f"总时长 {(time.time()-t_start)/60:.1f} 分钟")
     if not DRY:

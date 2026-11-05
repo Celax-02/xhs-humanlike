@@ -45,6 +45,11 @@ SERIAL = None
 USE_MOTION = True                # False 时退回 input swipe 匀速直线
 DRY = False                      # True 时只打印不注入
 
+# 每条 input 命令都要在设备上起一个进程，实测 90ms 上下。
+# 步数按这个耗时反推，否则「1 秒的慢拖」实际会在屏上按住 2 秒多。
+STEP_COST_MS = 90.0
+DEVICE_LOST = False              # adb 报设备不在了，需要中止而不是空转
+
 
 # ================= adb 基础 =================
 ADB_CANDIDATES = [
@@ -103,14 +108,33 @@ def ad(*args, timeout=25):
             if joined.startswith("input "):
                 return None
     try:
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
     except FileNotFoundError:
         sys.exit(f"找不到 adb（{ADB}）。\n"
                  "请安装 Android platform-tools，或用 --adb 指定完整路径。\n"
                  "更详细的环境检查：python3 doctor.py")
     except subprocess.TimeoutExpired:
         return None
+    if r.returncode != 0 and ("not found" in (r.stderr or "")
+                              or "no devices" in (r.stderr or "")):
+        globals()["DEVICE_LOST"] = True
+    return r
+
+
+def device_alive():
+    """adb 还认不认这台设备。掉线时所有命令都会失败，继续跑只是空转。"""
+    try:
+        out = subprocess.run([ADB, "devices"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=10).stdout
+    except Exception:
+        return False
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            if not SERIAL or parts[0] == SERIAL:
+                return True
+    return False
 
 
 def sh(*args, timeout=25):
@@ -152,6 +176,45 @@ def _ease(t, kind):
     return t * t * (3 - 2 * t)
 
 
+def measure_input_cost():
+    """
+    量一条 input 命令在设备上的真实耗时。
+    用 keyevent 0（KEYCODE_UNKNOWN）测，不碰界面，纯测量。
+    """
+    global STEP_COST_MS
+    if DRY:
+        return STEP_COST_MS
+    ts = []
+    for _ in range(3):
+        t0 = time.time()
+        r = sh("input", "keyevent", "0", timeout=10)
+        if r is None:
+            break
+        ts.append((time.time() - t0) * 1000)
+    ts = [t for t in ts if 5 < t < 500]
+    if len(ts) >= 2:
+        STEP_COST_MS = sorted(ts)[len(ts) // 2]
+    return STEP_COST_MS
+
+
+def plan_drag(dur_ms, dist):
+    """
+    给一条拖拽定「分几步」和「起步初位移」。
+    两件事都是为了躲开安卓的长按判定（按住 500ms 且位移 < 约 16px）：
+      - 步数按每条 input 命令的真机开销反推，保证屏上停留 ≈ dur_ms
+      - 起步先垫掉 26px，第一个 MOVE 就跨出触摸容差
+    返回 (steps, start)，start 是 0~0.15 的曲线前置比例。
+    """
+    per = max(50.0, STEP_COST_MS + 16)
+    steps = int(max(4, min(22, round(dur_ms / per))))
+    start = 0.0
+    if dist > 0:
+        # 上限 0.35 是为了让很短的拖拽（手抖那一下）也能跨出容差；
+        # 长距离的拖拽按 26px 折算，通常只有 5%~8%，曲线形状几乎不变。
+        start = min(0.35, max(0.05, 26.0 / dist))
+    return steps, start
+
+
 def drag(x1, y1, x2, y2, dur_ms, bow=None, ease="smooth", steps=None):
     """
     分段曲线拖拽。坐标已是真实像素，调用方负责缩放。
@@ -166,8 +229,10 @@ def drag(x1, y1, x2, y2, dur_ms, bow=None, ease="smooth", steps=None):
         sh("input", "swipe", x1, y1, x2, y2, int(dur_ms))
         return
 
+    dist = math.hypot(x2 - x1, y2 - y1)
+    auto_steps, start = plan_drag(dur_ms, dist)
     if steps is None:
-        steps = max(5, min(24, int(dur_ms / 27)))
+        steps = auto_steps
     if bow is None:
         # 多数时候几乎笔直，偶尔明显偏一点
         mag = random.choice([0, 0, random.uniform(3, 9), random.uniform(9, 24)])
@@ -175,13 +240,13 @@ def drag(x1, y1, x2, y2, dur_ms, bow=None, ease="smooth", steps=None):
 
     gap_ms = dur_ms / steps
     slp = ""
-    if gap_ms > 44:                 # 慢速拖拽才需要显式等待
-        slp = f"sleep {max(0.0, (gap_ms - 30) / 1000):.3f}; "
+    if gap_ms > STEP_COST_MS + 20:      # 只有比进程开销明显更慢才需要显式等待
+        slp = f"sleep {max(0.0, (gap_ms - STEP_COST_MS) / 1000):.3f}; "
 
     parts = [f"input motionevent DOWN {x1} {y1}"]
     for i in range(1, steps):
         t = i / steps
-        e = _ease(t, ease)
+        e = start + (1 - start) * _ease(t, ease)
         x = x1 + (x2 - x1) * e + bow * math.sin(math.pi * e)
         y = y1 + (y2 - y1) * e + random.uniform(-1.3, 1.3)
         parts.append(f"{slp}input motionevent MOVE {int(x)} {int(y)}")
@@ -484,7 +549,9 @@ DEEP_WEAK = re.compile(
 AD_WORDS = re.compile(
     r"报价|价格表|多少钱|优惠|团购|折扣|门店|地址|预约|招生|留学中介|代购|"
     r"加盟|代理|办证|贷款|保险|房产|装修|医美|减肥|祛痘|包过|速成|兼职|招聘|"
-    r"到手价|限时|私信|咨询|套餐|免费领|链接|购买", re.I)
+    r"到手价|限时|私信|咨询|套餐|免费领|链接|购买|最低价|巨折|大促|"
+    # 母婴/带货类软文最爱用的词，标题看着像「盘点」，点进去是卖货
+    r"宝妈|奶粉|纸尿裤|抄作业|旗舰店|异业|成交|带货|下单|秒杀|赠品|优惠券", re.I)
 
 
 def depth_score(title, imgs=1, is_ai=False):
@@ -652,13 +719,27 @@ def pick_note(notes, args):
 
 def open_note(seen, args, energy, stats=None, source="feed"):
     """点开、看完、退出。失败返回 None。source: feed（信息流）或 search（搜索结果）"""
+    want_page = "search" if source == "search" else "feed"
+    parser = search_notes if source == "search" else feed_notes
+
     root = dump_ui()
     if root is None:
         return None
-    parser = search_notes if source == "search" else feed_notes
     notes = [x for x in parser(root) if x[0] not in seen]
     if not notes:
-        return None
+        # 读不到卡，通常是页面已经不在目标页（停在详情页、搜索页或退到桌面）。
+        # 直接返回 None 会让调用方以为「这屏没好卡」而一直空滑，先自己找回来。
+        if focus() != want_page:
+            if want_page == "feed":
+                ensure_feed()
+            else:
+                back_to_feed()
+            root = dump_ui()
+            if root is None:
+                return None
+            notes = [x for x in parser(root) if x[0] not in seen]
+        if not notes:
+            return None
 
     # 选哪张卡：主题定向按配额纠偏，其余情况按深度偏好加权
     is_ai = False
@@ -696,6 +777,13 @@ def open_note(seen, args, energy, stats=None, source="feed"):
     time.sleep(lognorm(1.5, 0.42, 0.7, 4.0))
 
     if focus() != "detail":
+        # 网络慢或者卡片刚滑进来时，第一下常常点空。人也会再补一下。
+        time.sleep(lognorm(1.1, 0.40, 0.4, 2.6))
+        if focus() != "detail":
+            tap(cx, cy, hesitate=False)
+            time.sleep(lognorm(1.3, 0.40, 0.6, 3.2))
+
+    if focus() != "detail":
         return None
     seen.add(title)
     TOPIC_STATE["open"] += 1
@@ -715,11 +803,15 @@ def open_note(seen, args, energy, stats=None, source="feed"):
     imgs = 1
     root = dump_ui()
     if root is not None:
-        for n in root.iter("node"):
-            m = re.search(r"共(\d+)张", n.get("content-desc") or "")
-            if m:
-                imgs = int(m.group(1))
-                break
+        if is_share_sheet(root):        # 点开时手指压得太久，弹了分享面板
+            dismiss_share_sheet(root)
+            root = dump_ui()
+        if root is not None:
+            for n in root.iter("node"):
+                m = re.search(r"共(\d+)张", n.get("content-desc") or "")
+                if m:
+                    imgs = int(m.group(1))
+                    break
 
     depth = depth_score(title, imgs, is_ai)
     band = depth_band(depth)
@@ -850,6 +942,9 @@ def open_note(seen, args, energy, stats=None, source="feed"):
                 time.sleep(lognorm(1.4, 0.5, 0.4, 4.5))
             if chance(0.05):                        # 停下来再看一会儿
                 time.sleep(lognorm(5.5, 0.5, 1.5, 18.0))
+            if i and i % 3 == 0:                    # 隔几下滑一次，确认没被面板挡住
+                if is_share_sheet():
+                    dismiss_share_sheet()
 
     if not like_early:
         do_like()
@@ -964,12 +1059,44 @@ def seg_drift(deadline, seen, args, stats, energy):
     """
     quota = geom(0.42, 0, 9) if chance(0.85) else random.randint(10, 18)
     i = 0
+    fails = 0
     while time.time() < deadline:
         if i >= quota:
             r = open_note(seen, args, energy, stats)
             if r:
                 report(r, stats)
+                fails = 0
             else:
+                # 连续点不开通常不是「这屏没好卡」，而是页面被挡住了：
+                # 弹窗盖住信息流、停在别的页面、或者 App 自己卡住了。
+                # 只滑不查会一直空转，所以按严重程度逐级升级恢复手段。
+                fails += 1
+                if fails == 3:
+                    if not device_alive():
+                        print("\n❌ 设备已断开（USB 掉线或调试授权中断），本轮中止。\n"
+                              "   请重新插拔数据线、确认手机已解锁并允许 USB 调试后再继续。",
+                              flush=True)
+                        raise SystemExit(3)
+                    print("  ⚠️ 连续点不开，检查页面状态", flush=True)
+                    if not dismiss_overlay():
+                        ensure_feed()
+                elif fails == 6:
+                    if not device_alive():
+                        print("\n❌ 设备已断开，本轮中止。", flush=True)
+                        raise SystemExit(3)
+                    print("  ⚠️ 还是点不开，退回信息流重来", flush=True)
+                    dismiss_overlay()
+                    back()
+                    time.sleep(0.8)
+                    back()
+                    time.sleep(1.2)
+                    ensure_feed()
+                elif fails >= 9:
+                    if not device_alive():
+                        print("\n❌ 设备已断开，本轮中止。", flush=True)
+                        raise SystemExit(3)
+                    hard_recover()
+                    fails = 0
                 feed_swipe("normal")
                 stats["screens"] += 1
                 time.sleep(lognorm(2.6, 0.5, 0.8, 8.0))
@@ -1005,6 +1132,7 @@ def seg_deep(deadline, seen, args, stats, energy):
             report(r, stats)
             stagger = lognorm(1.6, 0.6, 0.3, 6.0) * (1.2 - energy * 0.5)
         else:
+            ensure_feed()                    # 连续两次点不开就主动找回来
             feed_swipe("normal")
             stats["screens"] += 1
             stagger = lognorm(2.4, 0.5, 0.6, 7.0)
@@ -1025,6 +1153,16 @@ def seg_rest(deadline, energy):
 
 
 # ================= 主题定向：搜索通路 =================
+def edit_box(root):
+    """搜索页的输入框。小红书改版后 class 仍然是 EditText，但加载有延迟"""
+    for n in root.iter("node"):
+        if "EditText" in (n.get("class") or ""):
+            b = parse_bounds(n.get("bounds"))
+            if b:
+                return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+    return None
+
+
 def open_search(kw):
     """从信息流进搜索，输入关键词并回车。成功（结果页有卡片）返回 True"""
     if focus() != "search":
@@ -1043,30 +1181,33 @@ def open_search(kw):
         if btn is None:
             return False
         tap(*btn)
-        time.sleep(lognorm(2.0, 0.30, 1.2, 3.6))
 
-    root = dump_ui()
-    if root is None:
-        return False
+    # 搜索页是冷启动的，偶尔 2 秒还没渲染完；轮询几次比一次判定稳
     box = None
-    for n in root.iter("node"):
-        if "EditText" in (n.get("class") or ""):
-            b = parse_bounds(n.get("bounds"))
-            if b:
-                box = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
-                break
+    for _ in range(3):
+        time.sleep(lognorm(1.2, 0.35, 0.6, 2.8))
+        root = dump_ui()
+        if root is None:
+            continue
+        box = edit_box(root)
+        if box:
+            break
     if box is None:
         return False
 
     tap(*box, hesitate=False)
     time.sleep(lognorm(0.9, 0.35, 0.35, 2.2))
-    sh("input", "text", kw)
+    sh("input", "text", kw.replace(" ", "%s"))   # input text 里 %s 才是空格
     time.sleep(lognorm(0.7, 0.40, 0.25, 2.0))
-    sh("input", "keyevent", "66")               # 回车提交
-    time.sleep(lognorm(3.4, 0.35, 2.0, 6.0))
+    sh("input", "keyevent", "66")                # 回车提交
 
-    root = dump_ui()
-    return root is not None and bool(search_notes(root))
+    # 结果页渲染比输入页慢，轮询到出卡片为止
+    for _ in range(4):
+        time.sleep(lognorm(1.6, 0.35, 0.8, 3.0))
+        root = dump_ui()
+        if root is not None and search_notes(root):
+            return True
+    return False
 
 
 def back_to_feed(limit=4):
@@ -1108,6 +1249,66 @@ def seg_topic_search(deadline, seen, args, stats, energy):
 
 
 # ================= 主流程 =================
+SHARE_LABELS = ("不感兴趣", "保存图片", "分享到", "复制链接", "分享给朋友",
+                "举报", "取消", "收藏到专辑")
+
+
+def is_share_sheet(root=None):
+    """
+    长按卡片/图片弹出的分享面板是同一个 Activity 里的浮层，
+    focus 看不出来，只能从节点上的固定文案认。
+    """
+    if root is None:
+        root = dump_ui()
+    if root is None:
+        return False
+    hit = 0
+    for n in root.iter("node"):
+        lab = (n.get("content-desc") or "").strip() or (n.get("text") or "").strip()
+        if lab in SHARE_LABELS:
+            hit += 1
+            if hit >= 2:
+                return True
+    return False
+
+
+def dismiss_share_sheet(root=None):
+    """长按误触弹出的分享面板：按返回关掉，不然接下来的滑动全都落在面板上"""
+    if not is_share_sheet(root):
+        return False
+    print("  🧹 误触长按弹了分享面板，按返回关掉", flush=True)
+    back()
+    time.sleep(lognorm(0.9, 0.35, 0.4, 2.0))
+    return True
+
+
+def dismiss_overlay():
+    """
+    活动弹窗、版本更新提示、青少年模式提醒会盖在信息流上：
+    focus 仍然是 feed，节点树里也还能读到卡片，但点哪儿都没反应。
+    只找「关闭/跳过」这类明确的按钮，找不到就返回 False。
+    """
+    if focus() != "feed":
+        return dismiss_share_sheet()      # 分享面板可能让 focus 变成 other
+    root = dump_ui()
+    if root is None:
+        return False
+    if is_share_sheet(root):
+        return dismiss_share_sheet(root)
+    for n in root.iter("node"):
+        label = (n.get("content-desc") or "").strip() or (n.get("text") or "").strip()
+        if label not in ("关闭", "关闭弹窗", "跳过", "以后再说", "暂不更新", "我知道了"):
+            continue
+        b = parse_bounds(n.get("bounds"))
+        if not b or b[1] > sy(2400):        # 太靠下的是底部导航，不是弹窗按钮
+            continue
+        tap((b[0] + b[2]) // 2, (b[1] + b[3]) // 2, hesitate=False)
+        print("  🧹 关掉一个挡路的弹窗", flush=True)
+        time.sleep(lognorm(1.0, 0.3, 0.5, 2.2))
+        return True
+    return False
+
+
 def ensure_feed():
     for _ in range(4):
         st = focus()
@@ -1119,6 +1320,23 @@ def ensure_feed():
             sh("monkey", "-p", PKG, "-c",
                "android.intent.category.LAUNCHER", "1")
         time.sleep(1.8)
+    return focus() == "feed"
+
+
+def hard_recover():
+    """
+    页面卡死的最后一招：杀掉 App 重开。
+    focus 还是 feed、卡片也在节点树里，但点哪儿都没反应——这种局面按返回救不回来。
+    人遇到 App 卡住也是这么干的，代价是信息流回到顶部。
+    """
+    print("  🔄 页面卡死，重启小红书", flush=True)
+    sh("am", "force-stop", PKG)
+    time.sleep(lognorm(1.6, 0.35, 0.8, 3.2))
+    sh("monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1")
+    time.sleep(lognorm(4.5, 0.35, 2.8, 8.0))
+    # 开屏广告/青少年模式弹窗可能挡在前面，先试着关一下
+    dismiss_overlay()
+    time.sleep(lognorm(1.4, 0.4, 0.6, 3.0))
     return focus() == "feed"
 
 
@@ -1186,6 +1404,7 @@ def main():
     w, h = detect_screen()
     if not DRY:
         sh("svc", "power", "stayon", "usb")
+        measure_input_cost()          # 步数按真机开销算，避免拖拽变成「长按」
     if not ensure_feed():
         print("❌ 没能回到信息流。请确认：手机已解锁、小红书已打开、USB 调试已授权。")
         print("   可先运行 python3 doctor.py 检查环境。")
@@ -1213,6 +1432,16 @@ def main():
 
     try:
         while time.time() < deadline:
+            if DEVICE_LOST:
+                if device_alive():
+                    globals()["DEVICE_LOST"] = False
+                    print("  ↻ 设备重新连上了，继续", flush=True)
+                else:
+                    print("\n❌ 设备已断开（USB 掉线或调试授权中断），本轮中止。\n"
+                          "   请重新插拔数据线、确认手机已解锁并允许 USB 调试后再继续。",
+                          flush=True)
+                    break
+
             frac = (time.time() - t_start) / max(1.0, args.minutes * 60)
             # 精力随机游走 + 随时间轻微衰减（越刷越疲）
             energy += random.gauss(0, 0.17) - frac * 0.045

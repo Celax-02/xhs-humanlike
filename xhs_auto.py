@@ -284,23 +284,36 @@ def chance(p):
 
 
 # ================= 页面判断 =================
-def focus():
+def window_state():
+    """
+    一次 dumpsys window，同时给出「页面类型」和「前台包名」。
+    之前分成 focus() 和 foreground_pkg() 两次读，白白多一次 adb 往返。
+    """
     if DRY:
-        return "feed"
+        return "feed", PKG
     r = sh("dumpsys", "window")
     if not r:
-        return "unknown"
+        return "unknown", None
     m = re.search(r"mCurrentFocus=Window\{\S+ \S+ (\S+?)\}", r.stdout)
     if not m:
-        return "unknown"
+        return "unknown", None
     w = m.group(1)
+    pkg = w.split("/", 1)[0] if "/" in w else None
     if ACT_DETAIL in w:
-        return "detail"
+        return "detail", pkg
     if ACT_SEARCH in w:
-        return "search"
+        return "search", pkg
     if ACT_FEED in w:
-        return "feed"
-    return "other"
+        return "feed", pkg
+    return "other", pkg
+
+
+def focus():
+    return window_state()[0]
+
+
+def foreground_pkg():
+    return window_state()[1]
 
 
 def dump_ui():
@@ -1309,18 +1322,131 @@ def dismiss_overlay():
     return False
 
 
-def ensure_feed():
-    for _ in range(4):
-        st = focus()
-        if st == "feed":
+HOME_TAB_LABELS = ("首页", "发现")
+
+
+def home_tab(root):
+    """
+    判断底部导航是否停在「首页」（发现页）。
+    IndexActivityV2 是主容器，消息/我/市集也都是同一个 Activity，
+    光看 focus() == "feed" 并不能说明人在信息流里。底栏节点的 selected 属性是可靠的：
+      content-desc="首页"  selected="true"   → 已经在发现页
+      content-desc="首页"  selected="false" → 在别的 tab，点一下就能回去
+    返回 (是否在首页, 首页按钮中心坐标或 None)
+    """
+    if root is None:
+        return False, None
+    candidates = []
+    for n in root.iter("node"):
+        d = (n.get("content-desc") or "").strip()
+        if d not in HOME_TAB_LABELS and not d.startswith("首页"):
+            continue
+        b = parse_bounds(n.get("bounds"))
+        if not b or b[1] < sy(1900):        # 只认底部导航，别把标题里的「首页」算进来
+            continue
+        c = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+        if n.get("selected") == "true" or "已选中" in d:
+            return True, c
+        candidates.append(c)
+    return False, (candidates[0] if candidates else None)
+
+
+def wake_screen():
+    """
+    亮屏并尝试解锁。锁屏时 uiautomator 读不到界面，adb 注入也进不了 App。
+    注意：dumpsys window 在已解锁时一样会打印 mKeyguardOccluded / KeyguardServiceDelegate，
+    不能用「输出里有没有 Keyguard」来判断，必须只看 mCurrentFocus 那一行。
+    有密码的设备无法绕过锁屏，只能提示用户手动解锁。
+    """
+    if DRY:
+        return True
+    p = sh("dumpsys", "power")
+    pw = (p.stdout if p else "") or ""
+    if re.search(r"mWakefulness=(Asleep|Doze)", pw):
+        sh("input", "keyevent", "224")        # KEYCODE_WAKEUP
+        time.sleep(lognorm(1.4, 0.35, 0.8, 2.8))
+
+    w = sh("dumpsys", "window")
+    ww = (w.stdout if w else "") or ""
+    m = re.search(r"mCurrentFocus=Window\{[^}]*\}", ww)
+    focus_line = m.group(0) if m else ""
+    locked = ("mDreamingLockscreen=true" in ww
+              or "Keyguard" in focus_line
+              or "NotificationShade" in focus_line
+              or "StatusBar" in focus_line)
+    if locked:
+        # 无密码设备上，上滑即可解锁；有密码会停在锁屏，后面 ensure_feed 会明确报错
+        sh("input", "swipe", SW // 2, int(SH * 0.86), SW // 2, int(SH * 0.24), 320)
+        time.sleep(lognorm(1.6, 0.35, 0.9, 3.0))
+    return not locked
+
+
+def launch_app():
+    """把小红书拉到前台。monkey 只要包名，不用记 Launcher Activity 的全名。"""
+    sh("monkey", "-p", PKG, "-c",
+       "android.intent.category.LAUNCHER", "1")
+    for _ in range(8):
+        time.sleep(lognorm(1.1, 0.3, 0.7, 2.0))
+        if foreground_pkg() == PKG:
             return True
-        if st in ("detail", "other", "search"):
+    return False
+
+
+def ensure_feed(verbose=False):
+    """
+    每段开始都调一次：确保「在小红书里 + 在首页 tab」，否则先把它带回去再刷。
+
+    逐级处理：亮屏解锁 → 不在 App 就拉起 → 在详情页/搜索页/其他页就按返回
+    → 在主容器但不在首页 tab 就点底栏「首页」→ 弹窗/分享面板挡路就关掉。
+    """
+    if DRY:
+        return True
+    for attempt in range(7):
+        st, pkg = window_state()
+        if pkg != PKG:
+            # 只有「看起来不在 App 里」才去检查亮屏/解锁，避免每段都多两次 dumpsys
+            wake_screen()
+            st, pkg = window_state()
+        if pkg != PKG:
+            if verbose and attempt == 0:
+                print("  🚀 当前不在小红书里，先打开 App", flush=True)
+            if not launch_app():
+                continue
+            dismiss_overlay()              # 开屏广告 / 版本更新提示
+            time.sleep(lognorm(1.6, 0.35, 0.9, 3.2))
+            continue
+
+        if st in ("detail", "search", "other", "unknown"):
             back()
-        else:
-            sh("monkey", "-p", PKG, "-c",
-               "android.intent.category.LAUNCHER", "1")
-        time.sleep(1.8)
-    return focus() == "feed"
+            time.sleep(lognorm(1.3, 0.35, 0.7, 2.6))
+            continue
+
+        # 已经在主容器了，但可能是「消息 / 我 / 市集」这些 tab，也可能被浮层盖着
+        root = dump_ui()
+        if root is None:
+            time.sleep(0.9)
+            continue
+        if is_share_sheet(root):
+            dismiss_share_sheet(root)
+            continue
+        on_home, btn = home_tab(root)
+        if on_home:
+            return True
+        if btn:
+            if verbose:
+                print("  🏠 不在首页 tab，点回「首页」", flush=True)
+            tap(*btn, hesitate=False)
+            time.sleep(lognorm(1.9, 0.35, 1.0, 3.6))
+            continue
+        if feed_notes(root):                # 底栏被隐藏但卡片在，说明确实在信息流
+            return True
+        # 底栏和卡片都还在加载：等一下再看。此处千万别按返回，按了会退出信息流。
+        dismiss_overlay()
+        time.sleep(lognorm(1.5, 0.35, 0.8, 3.2))
+
+    print("  ⚠️ 没能确认首页。若手机有锁屏密码，请先手动解锁；"
+          "再确认小红书已安装、USB 调试仍授权。", flush=True)
+    return False
 
 
 def hard_recover():
@@ -1405,8 +1531,10 @@ def main():
     if not DRY:
         sh("svc", "power", "stayon", "usb")
         measure_input_cost()          # 步数按真机开销算，避免拖拽变成「长按」
-    if not ensure_feed():
-        print("❌ 没能回到信息流。请确认：手机已解锁、小红书已打开、USB 调试已授权。")
+    print("↩ 准备中：确认小红书在首页…", flush=True)
+    if not ensure_feed(verbose=True):
+        print("❌ 没能回到小红书首页。请确认：手机已解锁（有锁屏密码的话先手动解开）、"
+              "小红书已安装、USB 调试仍授权。")
         print("   可先运行 python3 doctor.py 检查环境。")
         return
 

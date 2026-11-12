@@ -1065,19 +1065,34 @@ def seg_skim(deadline, seen, args, stats, energy, verbose):
         time.sleep(t)
 
 
+def drift_budget():
+    """
+    一段「正常浏览」的时长与点开篇数预算。
+    必须自己收尾：否则抽中权重最高的 drift 就会一口气刷到全局 deadline，
+    主循环再没机会换段、重算精力，整场日志只有一行「▸ 正常浏览」。
+    """
+    return (lognorm(95, 0.50, 35, 210),
+            max(2, int(lognorm(4, 0.50, 2, 10))))
+
+
 def seg_drift(deadline, seen, args, stats, energy):
     """
     正常节奏。
-    先抽一个「滑几屏才愿意点开一篇」的配额，滑够才点，不是每屏掷骰子
+    先抽一个「滑几屏才愿意点开一篇」的配额，滑够才点，不是每屏掷骰子；
+    这一段看够几篇 / 逛够几分钟就交回主循环，让人换个状态。
     """
+    span, budget = drift_budget()
+    seg_end = min(deadline, time.time() + span)
     quota = geom(0.42, 0, 9) if chance(0.85) else random.randint(10, 18)
     i = 0
+    opened = 0
     fails = 0
-    while time.time() < deadline:
+    while time.time() < seg_end and opened < budget:
         if i >= quota:
             r = open_note(seen, args, energy, stats)
             if r:
                 report(r, stats)
+                opened += 1
                 fails = 0
             else:
                 # 连续点不开通常不是「这屏没好卡」，而是页面被挡住了：

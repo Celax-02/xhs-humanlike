@@ -116,19 +116,22 @@
 
 ---
 
-## 场景六：定向刷某个主题
+## 场景六：把账号往 AI / AI 办公方向养
 
-> 在 `~/git/xhs-humanlike` 跑一场，要求点开的帖子有一半左右和 AI 相关：
+> 在 `~/git/xhs-humanlike` 跑一场 20 分钟，把推荐方向往 AI 和 AI 办公上带，
+> 尽量少点本地生活、母婴、留学中介这类跑偏内容：
 >
-> `python3 xhs_auto.py -t 20 --topic ai --topic-ratio 0.5`
+> `python3 xhs_auto.py -s <设备序列号> -t 20 --topic ai --topic-focus mixed --topic-ratio 0.7 --topic-strict 0.6 --depth 0.8 --like 0.03 --fav 0.01`
 >
 > 跑之前先 `adb devices -l` 确认设备在线、`python3 doctor.py` 确认节点树可读。
 > 后台运行，每 5 分钟看一次输出：
-> - 出现 `🔎 搜「xxx」看结果` 说明进入了搜索补量阶段，正常
-> - 搜索阶段如果连续打印「搜索页没打开」，说明搜索入口节点变了，停下来告我
-> - 结束时看最后一行 `主题命中 x/y 篇`，低于目标比例 10 个百分点以上才算跑偏
+> - 出现 `🔎 搜「AI办公」看结果 · 办公` 说明中文搜索生效；只有 `搜「AI」` 也正常，词是随机抽的
+> - 连续出现「搜索页没打开」，说明搜索入口节点变了，停下来告我
+> - 结束时看 `主题命中 x/y 篇`，目标 70% 左右；低于 60% 才算跑偏
+> - 如果日志里仍大量出现 `月子中心 / 留学 / 探店`，把 `--topic-strict` 提到 0.9 再跑一轮
 >
-> 别自己改 `--topic-ratio`，除非我明确说要调整。
+> 别自己改 `--topic-ratio`、`--topic-focus`、`--topic-strict`，除非我明确说要调整。
+> 多设备时必须带 `-s`；手机开了应用分身时脚本会自动带 `--user`，不用管。
 
 ---
 
@@ -137,7 +140,7 @@
 > 在 `~/git/xhs-humanlike` 跑一场，梗图、表情包、带货和招生帖扫两眼就退，
 > 优先点开方法论、复盘、原理解读这类长文：
 >
-> `python3 xhs_auto.py -t 20 --depth 0.8 --topic ai --topic-ratio 0.5`
+> `python3 xhs_auto.py -t 20 --depth 0.8 --topic ai --topic-ratio 0.7`
 >
 > 跑起来后确认三件事：
 > - 日志里 📚 开头的帖子停留时间明显比 💤 长（深帖通常 20s 以上，水帖 2~5s）

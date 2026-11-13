@@ -517,21 +517,52 @@ QUESTION = re.compile(r"[?？]")
 # ================= 主题定向 =================
 # 只做「在哪张卡上落手指」的偏好，不改任何客户端行为：
 # 仍是在信息流里滑动、点开、停留，只是选帖时按标题匹配主题。
+
+# 通用 AI：裸 AI / RAG 必须加词边界，否则 email、detail、storage 会被误判
+AI_CORE = (
+    r"(?<![A-Za-z])AI(?![A-Za-z])|AIGC|人工智能|大模型|语言模型|LLM|GPT|ChatGPT|OpenAI|"
+    r"Claude|Gemini|DeepSeek|千问|Qwen|通义|豆包|文心|Kimi|智谱|混元|Llama|Mistral|"
+    r"Grok|Sora|Midjourney|Agent|智能体|提示词|Prompt|(?<![A-Za-z])RAG(?![A-Za-z])|"
+    r"微调|多模态|生成式|具身智能|算力|机器学习|深度学习|神经网络|Transformer|"
+    r"Embedding|Copilot|Cursor|Codex|ComfyUI|Ollama|vLLM|HuggingFace|Suno|可灵|"
+    r"文生图|图生图|文生视频|英伟达|NVIDIA|GPU|CUDA|数字人|开源模型|模型训练"
+)
+
+# AI 办公 / 效率：把账号往「用 AI 干活」这个方向养。
+# 这些词即便单独出现也算方向命中 —— 推荐系统看到的就是「这类内容我愿意看」。
+OFFICE_WORDS = (
+    r"AI办公|智能办公|办公自动化|AI效率|AI提效|提效|降本增效|效率工具|"
+    r"AI工具|工具链|工作流|自动化|流程自动化|RPA|"
+    r"AI\s?PPT|PPT|幻灯片|演示文稿|Excel|智能表格|表格|"
+    r"AI文档|文档|周报|日报|月报|汇报|述职|OKR|"
+    r"会议纪要|纪要|会议记录|语音转写|录音转文字|"
+    r"待办|日程|笔记|知识库|知识管理|"
+    r"邮件|文案|润色|AI写作|写作|总结报告|"
+    r"项目管理|协同办公|协作|数字化办公|"
+    r"飞书|钉钉|企业微信|WPS|Notion|Obsidian|Gamma|ChatPPT|"
+    r"AI\s?Office|Productivity|AI\s?Workflow|Automation"
+)
+
 TOPIC_SETS = {
-    # 裸 AI / RAG 必须加词边界，否则 email、detail、storage 之类会被误判成 AI 内容
-    "ai": re.compile(
-        r"(?<![A-Za-z])AI(?![A-Za-z])|AIGC|人工智能|大模型|语言模型|LLM|GPT|ChatGPT|OpenAI|"
-        r"Claude|Gemini|DeepSeek|千问|Qwen|通义|豆包|文心|Kimi|智谱|混元|Llama|Mistral|"
-        r"Grok|Sora|Midjourney|Agent|智能体|提示词|Prompt|(?<![A-Za-z])RAG(?![A-Za-z])|"
-        r"微调|多模态|生成式|具身智能|算力|机器学习|深度学习|神经网络|Transformer|"
-        r"Embedding|Copilot|Cursor|Codex|ComfyUI|Ollama|vLLM|HuggingFace|Suno|可灵|"
-        r"文生图|图生图|文生视频|英伟达|NVIDIA|GPU|CUDA|数字人|开源模型|模型训练",
-        re.I),
+    "ai": re.compile(AI_CORE + r"|" + OFFICE_WORDS, re.I),
+    # 更窄的一个：只认办公场景，适合专门养「AI 办公」方向
+    "ai_office": re.compile(OFFICE_WORDS, re.I),
 }
+
+# 明确「方向不对」的内容：本地生活、母婴、留学中介、婚摄、车展……
+# 开主题定向时给极低权重；偶尔手滑点开也会按浅帖秒退
+OFF_TOPIC_WORDS = re.compile(
+    r"留学中介|留学申请|月子中心|母婴|宝妈|奶粉|纸尿裤|育儿|"
+    r"探店|网红店|美食|菜谱|打卡地|景点|旅游攻略|风景|随手拍|"
+    r"穿搭|OOTD|化妆|护肤|减肥|健身|瑜伽|"
+    r"车展|楼盘|买房|装修|宽带|店铺转让|婚纱|晨袍|婚礼|写真|"
+    r"宠物|星座|塔罗|情感|恋爱|相亲|幼儿园|学区房|"
+    r"双11|大促|团购|优惠券|免费领", re.I)
 
 # 全局计数：本轮点开多少篇、其中多少篇命中主题
 TOPIC_STATE = {"open": 0, "hit": 0}
 TOPIC = None
+TOPIC_STRICT = 0.0               # 由 --topic-strict 设置；0 = 不干预选卡
 
 # ================= 内容深度 =================
 # 标题里能读到的「值得坐下来看」的信号：方法论、复盘、原理解读、实测对比……
@@ -620,12 +651,55 @@ def card_weight(title, pref, is_ai=False):
     w = 1.0 + pref * (d - 0.45) * 2.6
     return max(0.06, w)
 
-# 搜索词只用 ASCII：adb 的 input text 打不出中文（需要额外装输入法）
-SEARCH_KW = ["AI", "AI Agent", "ChatGPT", "DeepSeek", "Claude", "GPT", "LLM", "Agent"]
+# ================= 搜索词池 =================
+# adb 的 input text 打不出中文，但小红书支持 xhsdiscover://search/result?keyword=
+# 直达搜索页（见 open_search_cn），所以中文词也能用 —— 而且比英文词更贴「AI 办公」。
+SEARCH_KW_AI = ["AI", "AI Agent", "ChatGPT", "DeepSeek", "Claude", "GPT", "LLM", "Agent"]
+SEARCH_KW_OFFICE_CN = [
+    "AI办公", "AI效率工具", "AI写PPT", "AI会议纪要", "AI周报",
+    "AI自动化工作流", "AI办公软件", "AI表格", "用AI提效", "AI职场",
+    "AI写作", "AI知识库", "AI项目管理",
+]
+SEARCH_KW_OFFICE_EN = [
+    "AI PPT", "AI Excel", "Copilot", "Notion AI", "WPS AI",
+    "Kimi", "AI Workflow", "AI Tools", "AI Office",
+]
+SEARCH_KW = SEARCH_KW_AI            # 兼容旧引用
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def pick_search_kw(focus="mixed"):
+    """按方向挑搜索词。mixed 让「AI 办公」占多数，同时留通用 AI 词打散"""
+    if focus == "ai":
+        return random.choice(SEARCH_KW_AI)
+    if focus == "office":
+        return random.choice(SEARCH_KW_OFFICE_CN if chance(0.8)
+                             else SEARCH_KW_OFFICE_EN)
+    if chance(0.62):
+        return random.choice(SEARCH_KW_OFFICE_CN)
+    return random.choice(SEARCH_KW_AI + SEARCH_KW_OFFICE_EN)
 
 
 def hits_topic(title):
     return bool(TOPIC and TOPIC.search(title or ""))
+
+
+def topic_bias(title, strict=None):
+    """
+    主题定向时的选卡权重倍数：相关内容抬上去，方向明显不对的压下去。
+    不是硬屏蔽 —— 真人偶尔也会手滑点开一条本地生活，只是概率很低。
+    """
+    if not TOPIC:
+        return 1.0
+    if strict is None:
+        strict = TOPIC_STRICT
+    if strict <= 0:
+        return 1.0
+    if hits_topic(title):
+        return 1.0 + 1.8 * strict
+    if OFF_TOPIC_WORDS.search(title or ""):
+        return max(0.04, 0.35 - 0.30 * strict)
+    return max(0.15, 1.0 - 0.60 * strict)
 
 
 def want_topic_hit(args):
@@ -723,10 +797,10 @@ def comment_depth(energy, depth=0.45):
 
 # ================= 打开一篇帖子 =================
 def pick_note(notes, args):
-    """按深度偏好加权挑一张卡；pref=0 时退化为纯随机"""
-    if args.depth <= 0 or len(notes) == 1:
-        return random.choice(notes)
-    ws = [card_weight(t, args.depth) for t, _, _ in notes]
+    """按「内容深度 × 主题方向」加权挑一张卡"""
+    if len(notes) == 1:
+        return notes[0]
+    ws = [card_weight(t, args.depth) * topic_bias(t) for t, _, _ in notes]
     return random.choices(notes, weights=ws)[0]
 
 
@@ -1191,7 +1265,70 @@ def edit_box(root):
     return None
 
 
+def current_user_id():
+    """从 mCurrentFocus 读出前台所属 Android 用户（应用分身是 u999 之类）"""
+    r = sh("dumpsys", "window")
+    line = next((l for l in ((r.stdout if r else "") or "").splitlines()
+                 if "mCurrentFocus=" in l), "")
+    m = re.search(r"\bu(\d+)\s", line)
+    return m.group(1) if m else None
+
+
+def open_search_cn(kw):
+    """
+    中文关键词走 URL scheme 直达搜索页：adb input text 打不出汉字，
+    但 xhsdiscover://search/result?keyword=<urlencoded> 可以。
+    必须带 --user：应用分身（u999）时不指定会拉起主用户 u0 的实例，
+    那样搜到、养到的会是另一个账号。
+    """
+    from urllib.parse import quote
+    url = "xhsdiscover://search/result?keyword=" + quote(kw, safe="")
+    parts = ["am", "start"]
+    uid = current_user_id()
+    if uid:
+        parts += ["--user", uid]
+    # 单引号包住 URL：设备端 shell 里 ? 是 glob 通配符，不包会出问题
+    parts += ["-a", "android.intent.action.VIEW", "-d", "'%s'" % url]
+    sh(*parts)
+
+    for _ in range(4):
+        time.sleep(lognorm(1.4, 0.35, 0.7, 3.0))
+        root = dump_ui()
+        if root is None:
+            continue
+        # 多数版本先落在「搜索框已预填」的输入页，点右上角「搜索」提交
+        btn = None
+        for n in root.iter("node"):
+            d = (n.get("content-desc") or "").strip()
+            t = (n.get("text") or "").strip()
+            if d == "搜索" or t == "搜索":
+                b = parse_bounds(n.get("bounds"))
+                if b and b[1] < sy(400) and b[0] > sx(700):
+                    btn = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+                    break
+        if btn:
+            tap(*btn, hesitate=False)
+            for _ in range(4):
+                time.sleep(lognorm(1.4, 0.35, 0.7, 3.0))
+                root = dump_ui()
+                if root is not None and search_notes(root):
+                    return True
+            return False
+        if search_notes(root):            # 有些版本直接落在结果页
+            return True
+    return False
+
+
 def open_search(kw):
+    """统一入口：中文词走 scheme，失败自动降级成 ASCII 词走原有输入路径"""
+    if CJK_RE.search(kw):
+        if open_search_cn(kw):
+            return True
+        kw = random.choice(SEARCH_KW_OFFICE_EN)
+    return open_search_ascii(kw)
+
+
+def open_search_ascii(kw):
     """从信息流进搜索，输入关键词并回车。成功（结果页有卡片）返回 True"""
     if focus() != "search":
         ensure_feed()
@@ -1249,12 +1386,13 @@ def back_to_feed(limit=4):
 
 def seg_topic_search(deadline, seen, args, stats, energy):
     """搜一个主题词，翻结果、点开看，然后回信息流"""
-    kw = random.choice(SEARCH_KW)
+    kw = pick_search_kw(getattr(args, "topic_focus", "mixed"))
     if not open_search(kw):
         print("    搜索页没打开，这轮跳过", flush=True)
         back_to_feed()
         return
-    print(f"    🔎 搜「{kw}」看结果", flush=True)
+    office = kw in SEARCH_KW_OFFICE_CN or kw in SEARCH_KW_OFFICE_EN
+    print(f"    🔎 搜「{kw}」看结果{' · 办公' if office else ''}", flush=True)
 
     n = max(2, int(lognorm(3.4, 0.45, 2, 8)))
     for i in range(n):
@@ -1506,16 +1644,21 @@ def main():
     ap.add_argument("-s", "--serial", default=None, help="adb 设备序列号（多设备时指定）")
     ap.add_argument("--adb", default=None, help="adb 可执行文件路径")
     ap.add_argument("--topic", choices=sorted(TOPIC_SETS), default=None,
-                    help="主题定向：只点相关内容占多数（目前支持 ai）")
-    ap.add_argument("--topic-ratio", type=float, default=0.5,
-                    help="主题内容占点开篇数的目标比例，默认 0.5")
+                    help="主题定向：ai（AI + AI 办公）、ai_office（只认办公场景）")
+    ap.add_argument("--topic-ratio", type=float, default=0.7,
+                    help="主题内容占点开篇数的目标比例，默认 0.7")
+    ap.add_argument("--topic-focus", choices=("mixed", "ai", "office"), default="mixed",
+                    help="搜索词方向：mixed 偏 AI 办公、ai 通用 AI、office 只搜办公，默认 mixed")
+    ap.add_argument("--topic-strict", type=float, default=0.6,
+                    help="选卡时对非主题内容的压制强度 0~1，默认 0.6；0 关闭")
     ap.add_argument("--depth", type=float, default=0.6,
                     help="内容深度偏好强度，0~1，默认 0.6；0 关闭（梗图与长文一视同仁）")
     args = ap.parse_args()
 
-    global USE_MOTION, SERIAL, ADB, DRY, LOCAL_UI, TOPIC
+    global USE_MOTION, SERIAL, ADB, DRY, LOCAL_UI, TOPIC, TOPIC_STRICT
     if args.topic:
         TOPIC = TOPIC_SETS[args.topic]
+        TOPIC_STRICT = max(0.0, min(1.0, args.topic_strict))
     if args.classic:
         USE_MOTION = False
     if args.dry_run:
@@ -1559,8 +1702,11 @@ def main():
           f"{'曲线触摸' if USE_MOTION else '直线滑动'}"
           f"{' · DRY-RUN' if DRY else ''} · Ctrl+C 停止")
     if TOPIC:
-        print(f"定向主题 {args.topic} · 目标占点开篇数 {args.topic_ratio:.0%}"
-              f" · 相关内容会看得更久、更容易点赞")
+        focus_cn = {"mixed": "AI + AI 办公（办公优先）", "ai": "通用 AI",
+                    "office": "AI 办公"}[args.topic_focus]
+        print(f"定向主题 {args.topic} · 方向 {focus_cn} · 目标占点开篇数 {args.topic_ratio:.0%}")
+        print(f"非主题内容压制 {TOPIC_STRICT:.0%} · 中文搜索词直达"
+              f"（Android 用户 u{current_user_id() or '0'}）")
     if args.depth > 0:
         print(f"深度偏好 {args.depth:.0%} · 优先点开有信息量的长文/复盘/原理解读，"
               f"梗图扫两眼就退")
@@ -1597,7 +1743,7 @@ def main():
             if TOPIC:
                 # 主题占比落后得越多，越容易安排一次「搜索 + 翻结果」
                 deficit = max(0.0, args.topic_ratio * (stats["notes"] + 1) - stats["ai"])
-                phases.append(("topic", 0.10 + 1.6 * deficit))
+                phases.append(("topic", 0.18 + 1.8 * deficit))
             pool = [(p, w) for p, w in phases if p != last and w > 0] or phases
             phase = random.choices([p[0] for p in pool],
                                    weights=[p[1] for p in pool])[0]
